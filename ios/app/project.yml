@@ -1,6 +1,6 @@
 name: DOOM
 options:
-  PRODUCT_BUNDLE_IDENTIFIER: com.aledemo82.doomios
+  bundleIdPrefix: com.aledemo82
   deploymentTarget:
     iOS: "26.0"
 settings:
