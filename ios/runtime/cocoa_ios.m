@@ -33,9 +33,18 @@ static int g_scr_w = 1920, g_scr_h = 1080, g_scr_hz = 60;   // landscape native 
 static UIViewController *g_root;
 static UIView *g_controls;
 static int g_vw, g_vh;                          // emulated display mode (0 = native)
-static double g_sens = 1.0;                     // look sensitivity multiplier (SENS button), touch and gyro
+static _Atomic double g_sens = 1.0;                     // look sensitivity multiplier (SENS button), touch and gyro
 static _Atomic int g_iface_orient;               // UIInterfaceOrientation, kept current from the main thread
 static _Atomic int g_gyro_on;                   // gyro aiming (GYRO button)
+static _Atomic BOOL g_touch_gyro_active;
+static BOOL g_touch_editing, g_touch_hidden;
+static BOOL g_touch_active = YES;
+static _Atomic NSUInteger g_touch_epoch;
+static NSUInteger g_menu_tap;
+static uint64_t g_menu_enter_hwnd;
+static void cancel_touch_input(void);
+static void update_touch_controls(void);
+static void touch_key(int mac, uint16_t ch, int down);
 static const double kSensSteps[] = { 0.5, 0.75, 1.0, 1.5, 2.0, 3.0 };
 
 static void on_main(dispatch_block_t b) { if ([NSThread isMainThread]) b(); else dispatch_sync(dispatch_get_main_queue(), b); }
@@ -100,7 +109,9 @@ static void mouse_motion(uint64_t hwnd, int dx, int dy, int x, int y) {
 }
 // Trackpad style: dragging moves the cursor by relative motion, a short tap without movement is a left click at the cursor.
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
-    if (self.tracking) return;
+    // Hiding the overlay still allows direct touches on the game surface.
+    if (!g_touch_active || g_touch_editing || self.tracking ||
+        self.hwnd != atomic_load(&g_key_hwnd)) return;
     UITouch *t = ts.anyObject; self.tracking = t; self.last = self.start = [t locationInView:self];
     self.downAt = CACurrentMediaTime(); self.moved = NO;
 }
@@ -124,23 +135,27 @@ static void mouse_motion(uint64_t hwnd, int dx, int dy, int x, int y) {
     uint64_t hwnd = self.hwnd;
     int x, y; [self point:t x:&x y:&y];
     mouse_motion(hwnd, x - atomic_load(&g_cx), y - atomic_load(&g_cy), x, y);
+    NSUInteger epoch = g_touch_epoch, tap = ++g_menu_tap;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        rt_log("[cocoa] tap click at %d,%d\n", atomic_load(&g_cx), atomic_load(&g_cy));
-        // The menus' "[ENTER] SELECT" acts on the highlighted item; a mouse click on a checkbox toggled it twice
-        // (net nothing), so a tap presses Enter on the item under the cursor instead.
-        extern void win_key_from_cocoa(uint64_t hwnd, uint16_t mac_keycode, int down, int repeat, const uint16_t *chars, int nchars);
-        uint16_t cr = '\r';
-        win_key_from_cocoa(hwnd, 36, 1, 0, &cr, 1);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 90 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ win_key_from_cocoa(hwnd, 36, 0, 0, NULL, 0); });
+        if (epoch != g_touch_epoch || tap != g_menu_tap || atomic_load(&g_pointer_locked) ||
+            hwnd != atomic_load(&g_key_hwnd) || !hwnd || g_menu_enter_hwnd) return;
+        g_menu_enter_hwnd = hwnd;
+        touch_key(36, '\r', 1);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 90 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            if (epoch != g_touch_epoch || g_menu_enter_hwnd != hwnd) return;
+            g_menu_enter_hwnd = 0;
+            touch_key(36, '\r', 0);
+        });
     });
 }
-- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self touchesEnded:ts withEvent:e]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    if (self.tracking && [ts containsObject:self.tracking]) self.tracking = nil;
+}
 @end
 
 // ---------------- root view controller ----------------
 static void relayout_all(void);
 static void overlay_front(void);
-static void release_latched(void);
 @interface RTRootViewController : UIViewController @end
 @implementation RTRootViewController
 - (void)loadView { UIView *v = [UIView new]; v.backgroundColor = UIColor.blackColor; self.view = v; }
@@ -191,6 +206,7 @@ void *cocoa_window_new(uint64_t hwnd, int x, int y, int cw, int ch, int titled, 
 void cocoa_window_free(void *p) {
     on_main(^{
         RTView *v = (__bridge_transfer RTView *)p;
+        if (atomic_load(&g_key_hwnd) == v.hwnd) cancel_touch_input();
         [v removeFromSuperview]; [g_views removeObject:v];
         if (atomic_load(&g_key_hwnd) == v.hwnd) atomic_store(&g_key_hwnd, 0);
     });
@@ -201,9 +217,12 @@ void cocoa_window_show(void *p, int show, int activate) {
         v.hidden = !show;
         if (show) {
             [g_root.view bringSubviewToFront:v]; overlay_front();
+            if (atomic_load(&g_key_hwnd) != v.hwnd) cancel_touch_input();
             atomic_store(&g_key_hwnd, v.hwnd);
             win_from_cocoa(v.hwnd, WM_ACTIVATE, 1, 0);
             win_from_cocoa(v.hwnd, WM_SETFOCUS, 0, 0);
+        } else if (atomic_load(&g_key_hwnd) == v.hwnd) {
+            cancel_touch_input();
         }
     });
 }
@@ -249,9 +268,13 @@ void cocoa_pump(int wait_ms) {
 void cocoa_cursor_pos(int *x, int *y) { *x = atomic_load(&g_cx); *y = atomic_load(&g_cy); }
 void cocoa_set_cursor_pos(int x, int y) { atomic_store(&g_cx, x); atomic_store(&g_cy, y); }
 void cocoa_cursor_visible(int v) {
-    atomic_store(&g_pointer_locked, !v);
+    int previous = atomic_exchange(&g_pointer_locked, !v);
     rt_log("[cocoa] mouse capture %s\n", v ? "off" : "on");
-    dispatch_async(dispatch_get_main_queue(), ^{ [g_root setNeedsUpdateOfPrefersPointerLocked]; g_controls.hidden = v; if (v) release_latched(); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [g_root setNeedsUpdateOfPrefersPointerLocked];
+        if (previous != !v) cancel_touch_input();
+        update_touch_controls();
+    });
 }
 void cocoa_mouse_delta(int *dx, int *dy) { *dx = atomic_exchange(&g_dx, 0); *dy = atomic_exchange(&g_dy, 0); }
 
@@ -344,284 +367,660 @@ static void attach_mouse(GCMouse *m) {
 }
 
 
-// ---------------- on-screen keys ----------------
-// A row of buttons over the game for the keys menus need without a keyboard (Space to continue, Esc, Enter, arrows).
-static UIView *g_overlay;
-static void overlay_front(void) { if (g_controls) [g_root.view bringSubviewToFront:g_controls]; if (g_overlay) [g_root.view bringSubviewToFront:g_overlay]; }
-static void send_key(int mac, uint16_t ch, int down) {
+// ---------------- touch overlay ----------------
+
+// The menu Enter button and the delayed menu tap can hold the same key.
+// Likewise ALT FIRE can hold primary fire while another finger uses FIRE.
+static unsigned g_touch_keys[128], g_touch_mouse[5];
+static CGFloat g_touch_target = 44, g_stick_float = 8;  // main thread, updated with the layout
+
+static void touch_key(int mac, uint16_t ch, int down) {
     uint64_t hwnd = atomic_load(&g_key_hwnd);
     if (!hwnd) return;
-    win_key_from_cocoa(hwnd, (uint16_t)mac, down, 0, down && ch ? &ch : NULL, down && ch ? 1 : 0);
-}
-@interface RTKeyButton : UIButton @property int mac; @property uint16_t ch; @end
-@implementation RTKeyButton
-- (void)pressed { send_key(self.mac, self.ch, 1); }
-- (void)released { send_key(self.mac, self.ch, 0); }
-@end
-static void build_overlay(void) {
-    static const struct { const char *label; int mac; uint16_t ch; } keys[] = {
-        {"Esc", 53, 0x1B}, {"Enter", 36, '\r'}, {"Space", 49, ' '}, {"Tab", 48, '\t'},
-        {"\u25C0", 123, 0}, {"\u25B2", 126, 0}, {"\u25BC", 125, 0}, {"\u25B6", 124, 0}, {"Y", 16, 'y'}, {"N", 45, 'n'},
-    };
-    UIView *row = [UIView new];
-    g_overlay = row;
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-    UIStackView *st = [UIStackView new];
-    st.axis = UILayoutConstraintAxisHorizontal; st.spacing = 6; st.translatesAutoresizingMaskIntoConstraints = NO;
-    for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
-        RTKeyButton *b = [RTKeyButton buttonWithType:UIButtonTypeSystem];
-        b.mac = keys[i].mac; b.ch = keys[i].ch;
-        [b setTitle:[NSString stringWithUTF8String:keys[i].label] forState:UIControlStateNormal];
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
-        b.layer.cornerRadius = 8; b.layer.borderWidth = 1; b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
-        [b.widthAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
-        [b.heightAnchor constraintEqualToConstant:36].active = YES;
-        [b addTarget:b action:@selector(pressed) forControlEvents:UIControlEventTouchDown];
-        [b addTarget:b action:@selector(released) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-        [st addArrangedSubview:b];
-    }
-    UIButton *hide = [UIButton buttonWithType:UIButtonTypeSystem];
-    [hide setTitle:@"\u2328" forState:UIControlStateNormal];
-    [hide setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    hide.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; hide.layer.cornerRadius = 8;
-    hide.translatesAutoresizingMaskIntoConstraints = NO;
-    [hide.widthAnchor constraintEqualToConstant:44].active = YES; [hide.heightAnchor constraintEqualToConstant:36].active = YES;
-    [hide addAction:[UIAction actionWithHandler:^(UIAction *a) { st.hidden = !st.hidden; }] forControlEvents:UIControlEventTouchUpInside];
-    [g_root.view addSubview:g_overlay];
-    [row addSubview:st]; [row addSubview:hide];
-    UILayoutGuide *g = g_root.view.safeAreaLayoutGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [row.topAnchor constraintEqualToAnchor:g.topAnchor constant:8], [row.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:8],
-        [row.heightAnchor constraintEqualToConstant:36],
-        [hide.leadingAnchor constraintEqualToAnchor:row.leadingAnchor], [hide.topAnchor constraintEqualToAnchor:row.topAnchor],
-        [st.leadingAnchor constraintEqualToAnchor:hide.trailingAnchor constant:6], [st.topAnchor constraintEqualToAnchor:row.topAnchor],
-        [row.trailingAnchor constraintEqualToAnchor:st.trailingAnchor],
-    ]];
+    unsigned *count = &g_touch_keys[mac];
+    BOOL changed = down ? (*count)++ == 0 : (*count && --*count == 0);
+    if (changed) win_key_from_cocoa(hwnd, (uint16_t)mac, down, 0, down && ch ? &ch : NULL, down && ch ? 1 : 0);
 }
 
-
-// ---------------- touch controls (gameplay) ----------------
-// Left: a stick that holds W/A/S/D. Right: fire, alt fire, jump, use, melee, chainsaw (G), use equipment (mouse 3), next equipment (F1), quick-switch, weapon wheel.
-// Shown while the game has captured the mouse (cocoa_cursor_visible(0)), i.e. in gameplay.
-@interface RTStick : UIView
-@property(strong) UIView *knob; @property(weak) UITouch *tracking; @property int dirs;   // bit0 W, 1 A, 2 S, 3 D
-@end
-@implementation RTStick
-- (instancetype)initWithFrame:(CGRect)f {
-    if ((self = [super initWithFrame:f])) {
-        self.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12]; self.layer.cornerRadius = f.size.width / 2;
-        self.layer.borderWidth = 2; self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
-        CGFloat k = f.size.width * 0.4;
-        self.knob = [[UIView alloc] initWithFrame:CGRectMake((f.size.width - k) / 2, (f.size.height - k) / 2, k, k)];
-        self.knob.backgroundColor = [UIColor colorWithWhite:1 alpha:0.5]; self.knob.layer.cornerRadius = k / 2; self.knob.userInteractionEnabled = NO;
-        [self addSubview:self.knob];
-    }
-    return self;
+static void touch_mouse(int button, int down) {
+    uint64_t hwnd = atomic_load(&g_key_hwnd);
+    if (!hwnd) return;
+    unsigned *count = &g_touch_mouse[button];
+    if (down ? (*count)++ == 0 : (*count && --*count == 0)) mouse_button(hwnd, button, down);
 }
-- (void)setDirs:(int)d {
-    static const int mac[4] = { 13, 0, 1, 2 };   // W A S D
-    for (int i = 0; i < 4; i++) if (((d ^ _dirs) >> i) & 1) send_key(mac[i], 0, (d >> i) & 1);
-    _dirs = d;
-}
-- (void)update:(UITouch *)t {
-    CGPoint p = [t locationInView:self], c = CGPointMake(self.bounds.size.width / 2, self.bounds.size.height / 2);
-    double R = self.bounds.size.width / 2, dx = p.x - c.x, dy = p.y - c.y, len = hypot(dx, dy);
-    if (len > R) { dx *= R / len; dy *= R / len; len = R; }
-    self.knob.center = CGPointMake(c.x + dx, c.y + dy);
-    double nx = dx / R, ny = dy / R; int d = 0;
-    if (len > R * 0.25) { if (ny < -0.38) d |= 1; if (nx < -0.38) d |= 2; if (ny > 0.38) d |= 4; if (nx > 0.38) d |= 8; }
-    self.dirs = d;
-}
-- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { if (!self.tracking) { self.tracking = ts.anyObject; [self update:self.tracking]; } }
-- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { if (self.tracking && [ts containsObject:self.tracking]) [self update:self.tracking]; }
-- (void)end:(NSSet<UITouch *> *)ts {
-    if (!self.tracking || ![ts containsObject:self.tracking]) return;
-    self.tracking = nil; self.dirs = 0;
-    self.knob.center = CGPointMake(self.bounds.size.width / 2, self.bounds.size.height / 2);
-}
-- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self end:ts]; }
-- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self end:ts]; }
-@end
 
 typedef enum { ACT_KEY, ACT_MOUSE, ACT_WHEEL, ACT_CUSTOM } ActKind;
-@interface RTActionButton : UIButton @property ActKind kind; @property int code, arg; @property(copy) void (^tap)(RTActionButton *); @property BOOL armed; @property double downAt; @end
+@interface RTActionButton : UIButton
+@property ActKind kind;
+@property int code, arg;
+@property uint16_t character;
+@property(nonatomic) BOOL held, armed, pulsePrimary, pulseSecondary;
+@property NSUInteger sequence;
+- (void)cancelInput;
+- (void)updateTitle;
+@end
+
+static CGFloat bounded(CGFloat value, CGFloat lower, CGFloat upper) {
+    return fmax(lower, fmin(value, upper));
+}
+
+static CGRect touch_bounds(CGRect frame, CGFloat minimum) {
+    return CGRectInset(frame, -fmax(0, minimum - frame.size.width) / 2,
+                             -fmax(0, minimum - frame.size.height) / 2);
+}
+
 @implementation RTActionButton
-- (void)fire:(int)down {
-    uint64_t hwnd = atomic_load(&g_key_hwnd);
-    if (self.kind == ACT_KEY) send_key(self.code, 0, down);
-    else if (self.kind == ACT_MOUSE) mouse_button(hwnd, self.code, down);
-    else if (down) {
-        di_mouse_wheel(self.arg);
-        win_from_cocoa(hwnd, WM_MOUSEWHEEL, mk_flags() | (uint64_t)(uint16_t)(int16_t)self.arg << 16, pack_pos(atomic_load(&g_cx), atomic_load(&g_cy)));
-    }
-    self.alpha = down ? 1.0 : 0.75;
+- (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)event {
+    return CGRectContainsPoint(touch_bounds(self.bounds, g_touch_target), p);
 }
-// ALT FIRE (right mouse button, the secondary fire) is held while the primary fire is pressed, which two thumbs can't do
-// alongside the stick and look. Press and hold it: the right button is down while you hold. Once it has been held for
-// 0.5 s the button lights up (armed); letting go then fires the primary button, then releases the right button. Let go
-// before 0.5 s and it only releases (a plain hold, e.g. zoom).
+
 - (BOOL)isSecondary { return self.kind == ACT_MOUSE && self.code == 2; }
-- (void)setArmed:(BOOL)on {
-    _armed = on;
-    self.backgroundColor = [UIColor colorWithWhite:1 alpha:on ? 0.55 : 0.22];
-    self.layer.borderColor = (on ? UIColor.systemOrangeColor : [UIColor colorWithWhite:1 alpha:0.45]).CGColor;
+
+- (void)setArmed:(BOOL)armed {
+    _armed = armed;
+    self.layer.borderColor = (armed ? UIColor.systemOrangeColor : [UIColor colorWithWhite:1 alpha:0.45]).CGColor;
 }
+
+- (void)updateTitle {
+    if (self.kind != ACT_CUSTOM) return;
+    NSString *title = self.code == 0
+        ? [NSString stringWithFormat:@"SENS\n%.2gx", atomic_load(&g_sens)]
+        : (atomic_load(&g_gyro_on) ? @"GYRO\nON" : @"GYRO\nOFF");
+    [self setTitle:title forState:UIControlStateNormal];
+}
+
 - (void)pressed {
-    if (self.kind == ACT_CUSTOM) return;
-    [self fire:1];
-    if ([self isSecondary]) {
-        self.downAt = CACurrentMediaTime();
-        double t0 = self.downAt;
+    if (self.held || self.pulseSecondary || !g_touch_active || g_touch_editing || g_touch_hidden ||
+        !atomic_load(&g_key_hwnd)) return;
+    self.held = YES;
+    if (self.kind == ACT_KEY) touch_key(self.code, self.character, 1);
+    if (self.kind == ACT_MOUSE) touch_mouse(self.code, 1);
+    if (self.kind == ACT_WHEEL) {
+        di_mouse_wheel(self.arg);
+        win_from_cocoa(atomic_load(&g_key_hwnd), WM_MOUSEWHEEL,
+                       mk_flags() | (uint64_t)(uint16_t)(int16_t)self.arg << 16,
+                       pack_pos(atomic_load(&g_cx), atomic_load(&g_cy)));
+    }
+    if (self.isSecondary) {
+        NSUInteger sequence = ++self.sequence;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (self.downAt == t0 && self.state & UIControlStateHighlighted) self.armed = YES;   // still the same press
+            if (sequence == self.sequence && self.held) self.armed = YES;
         });
     }
 }
-- (void)released {
-    if (self.kind == ACT_CUSTOM) { if (self.tap) self.tap(self); return; }
-    if ([self isSecondary]) {
-        BOOL fireNow = self.armed;
-        self.downAt = 0; self.armed = NO;
-        if (fireNow) {   // held long enough: primary fire while the secondary is still down, then let both go
-            uint64_t hwnd = atomic_load(&g_key_hwnd);
-            mouse_button(hwnd, 1, 1);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-                mouse_button(hwnd, 1, 0);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ mouse_button(hwnd, 2, 0); });
-            });
-            self.alpha = 0.75;
-            return;
-        }
-    }
-    [self fire:0];
+
+- (void)cancelInput {
+    self.sequence++;
+    self.armed = NO;
+    if (self.held && self.kind == ACT_KEY) touch_key(self.code, self.character, 0);
+    if (self.held && self.kind == ACT_MOUSE) touch_mouse(self.code, 0);
+    if (self.pulsePrimary) touch_mouse(1, 0);
+    if (self.pulseSecondary) touch_mouse(2, 0);
+    self.held = self.pulsePrimary = self.pulseSecondary = NO;
 }
-// Hold FIRE or ALT FIRE and drag the same finger to keep aiming while it is held.
-- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
-    [super touchesMoved:ts withEvent:e];
-    // FIRE and ALT FIRE: dragging the held finger aims. SWAP (Q): holding opens the weapon wheel and dragging picks a weapon.
-    if (!(self.kind == ACT_MOUSE || (self.kind == ACT_KEY && self.code == 12))) return;
-    UITouch *t = ts.anyObject;
-    CGPoint p = [t locationInView:g_root.view], q = [t previousLocationInView:g_root.view];
+
+// Releasing an armed ALT FIRE performs the existing primary/secondary sequence.
+// Cancellation only releases buttons. Old callbacks cannot affect a new touch.
+- (void)released {
+    if (!self.held) return;
+    if (self.isSecondary && self.armed) {
+        NSUInteger sequence = ++self.sequence;
+        self.held = self.armed = NO;
+        self.pulsePrimary = self.pulseSecondary = YES;
+        touch_mouse(1, 1);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            if (sequence != self.sequence) return;
+            self.pulsePrimary = NO;
+            touch_mouse(1, 0);
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 160 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            if (sequence != self.sequence) return;
+            self.pulseSecondary = NO;
+            touch_mouse(2, 0);
+        });
+        return;
+    }
+    if (self.kind == ACT_CUSTOM) {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        if (self.code == 0) {
+            double current = atomic_load(&g_sens);
+            NSUInteger count = sizeof kSensSteps / sizeof *kSensSteps, index = 0;
+            while (index < count && kSensSteps[index] <= current) index++;
+            double next = kSensSteps[index % count];
+            atomic_store(&g_sens, next);
+            [defaults setDouble:next forKey:@"sens"];
+        } else {
+            BOOL enabled = !atomic_load(&g_gyro_on);
+            atomic_store(&g_gyro_on, enabled);
+            [defaults setBool:enabled forKey:@"gyro"];
+        }
+        [self updateTitle];
+    }
+    [self cancelInput];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesMoved:touches withEvent:event];
+    if (!self.held || !(self.kind == ACT_MOUSE || (self.kind == ACT_KEY && self.code == 12))) return;
+    UITouch *touch = touches.anyObject;
+    CGPoint p = [touch locationInView:g_root.view], q = [touch previousLocationInView:g_root.view];
     uint64_t hwnd = atomic_load(&g_key_hwnd);
-    double k = 1.6 * g_sens;
-    for (RTView *v in g_views) if (v.hwnd == hwnd) k *= v.pxPerPt;
-    int dx = (int)lround((p.x - q.x) * k), dy = (int)lround((p.y - q.y) * k);
-    if (dx || dy) mouse_motion(hwnd, dx, dy, clampi(atomic_load(&g_cx) + dx, 0, 4095), clampi(atomic_load(&g_cy) + dy, 0, 4095));
+    double scale = 1.6 * atomic_load(&g_sens);
+    for (RTView *view in g_views) if (view.hwnd == hwnd) scale *= view.pxPerPt;
+    int dx = (int)lround((p.x - q.x) * scale), dy = (int)lround((p.y - q.y) * scale);
+    if (dx || dy) mouse_motion(hwnd, dx, dy, clampi(atomic_load(&g_cx) + dx, 0, 4095),
+                                            clampi(atomic_load(&g_cy) + dy, 0, 4095));
 }
 @end
 
-static RTActionButton *action(NSString *title, ActKind kind, int code, int arg, CGFloat size) {
-    RTActionButton *b = [RTActionButton buttonWithType:UIButtonTypeCustom];
-    b.kind = kind; b.code = code; b.arg = arg;
-    [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:size > 80 ? 20 : 14];
-    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.22]; b.alpha = 0.75;
-    b.layer.cornerRadius = size / 2; b.layer.borderWidth = 2; b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.45].CGColor;
-    b.bounds = CGRectMake(0, 0, size, size);
-    [b addTarget:b action:@selector(pressed) forControlEvents:UIControlEventTouchDown];
-    [b addTarget:b action:@selector(released) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-    return b;
-}
-@interface RTControlsView : UIView @property(strong) RTStick *stick; @property(strong) NSArray<RTActionButton *> *buttons; @property(strong) NSArray<NSValue *> *offsets; @end
-@implementation RTControlsView
-// The left half of the screen is a floating stick: a touch there puts the stick under the finger. Buttons keep their own
-// touches; the right half's empty space goes to the game view (look).
-- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
-    UIView *v = [super hitTest:p withEvent:e];
-    if (v != self) return v;
-    return p.x < self.bounds.size.width * 0.5 ? self : nil;
-}
-- (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
-    if (self.stick.tracking) return;
-    UITouch *t = ts.anyObject; CGPoint p = [t locationInView:self];
-    CGFloat h = self.stick.bounds.size.width / 2;
-    p.x = fmax(h, fmin(p.x, self.bounds.size.width - h)); p.y = fmax(h, fmin(p.y, self.bounds.size.height - h));
-    self.stick.center = p; self.stick.alpha = 1;
-    self.stick.tracking = t; [self.stick update:t];
-}
-- (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { if (self.stick.tracking && [ts containsObject:self.stick.tracking]) [self.stick update:self.stick.tracking]; }
-- (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
-    if (!self.stick.tracking || ![ts containsObject:self.stick.tracking]) return;
-    [self.stick end:ts];
-    self.stick.alpha = 0.55; [self setNeedsLayout];   // back to the resting spot
-}
-- (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self touchesEnded:ts withEvent:e]; }
+@interface RTStick : UIView
+@property(nonatomic, strong) UIView *knob;
+@property(nonatomic) int dirs;
+- (void)updateFromOffset:(CGPoint)offset;
+@end
+
+@implementation RTStick
 - (void)layoutSubviews {
     [super layoutSubviews];
-    UIEdgeInsets in = self.safeAreaInsets; CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
-    CGFloat sz = 150;
-    if (!self.stick.tracking) self.stick.frame = CGRectMake(in.left + 40, H - in.bottom - sz - 30, sz, sz);
-    for (NSUInteger i = 0; i < self.buttons.count; i++) {       // offsets are from the bottom-right corner
-        CGPoint o = self.offsets[i].CGPointValue;
-        self.buttons[i].center = CGPointMake(W - in.right - o.x, H - in.bottom - o.y);
-    }
-}
-@end
-static void release_latched(void) {   // main thread: leaving gameplay lets go of a held ALT FIRE
-    for (RTActionButton *b in ((RTControlsView *)g_controls).buttons) if (b.armed || b.downAt) { b.armed = NO; b.downAt = 0; mouse_button(atomic_load(&g_key_hwnd), 2, 0); }
-}
-static void build_controls(void) {
-    RTControlsView *v = [RTControlsView new];
-    v.translatesAutoresizingMaskIntoConstraints = NO; v.hidden = YES;
-    v.stick = [[RTStick alloc] initWithFrame:CGRectMake(0, 0, 150, 150)];
-    v.stick.userInteractionEnabled = NO; v.stick.alpha = 0.55;   // resting hint; the controls view drives it
-    [v addSubview:v.stick];
-    struct { const char *t; ActKind k; int code, arg; CGFloat size, x, y; } defs[] = {
-        {"FIRE", ACT_MOUSE, 1, 0, 104, 95, 95},
-        {"ALT\nFIRE", ACT_MOUSE, 2, 0, 66, 60, 215},
-        {"JUMP", ACT_KEY, 49, 0, 74, 205, 62},
-        {"USE\nEQUIP", ACT_MOUSE, 4, 0, 66, 300, 62},
-        {"USE", ACT_KEY, 14, 0, 58, 175, 150},
-        {"MELEE", ACT_KEY, 3, 0, 58, 245, 150},
-        {"CHAIN\nSAW", ACT_KEY, 5, 0, 58, 315, 150},
-        {"SWAP\nWHEEL", ACT_KEY, 12, 0, 58, 385, 62},
-        {"NEXT\nEQUIP", ACT_KEY, 122, 0, 58, 385, 150},
-        {"WPN \u25B2", ACT_WHEEL, 0, 120, 52, 45, 305},
-        {"WPN \u25BC", ACT_WHEEL, 0, -120, 52, 45, 365},
-        {"SENS\n1.0x", ACT_CUSTOM, 0, 0, 52, 45, 425},
-        {"GYRO\noff", ACT_CUSTOM, 1, 0, 52, 45, 485},
-    };
-    NSMutableArray *bs = [NSMutableArray array], *os = [NSMutableArray array];
-    for (size_t i = 0; i < sizeof defs / sizeof *defs; i++) {
-        RTActionButton *b = action([NSString stringWithUTF8String:defs[i].t], defs[i].k, defs[i].code, defs[i].arg, defs[i].size);
-        b.titleLabel.numberOfLines = 2; b.titleLabel.textAlignment = NSTextAlignmentCenter;
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:defs[i].size > 80 ? 20 : 11];
-        if (defs[i].k == ACT_CUSTOM) {
-            if (defs[i].code == 0) {   // SENS: next step
-                NSInteger idx = 2; for (NSInteger j = 0; j < 6; j++) if (fabs(kSensSteps[j] - g_sens) < 0.01) idx = j;
-                void (^show)(RTActionButton *) = ^(RTActionButton *bb) { [bb setTitle:[NSString stringWithFormat:@"SENS\n%.2gx", g_sens] forState:UIControlStateNormal]; };
-                show(b);
-                b.tap = ^(RTActionButton *bb) {
-                    NSInteger k = 2; for (NSInteger j = 0; j < 6; j++) if (fabs(kSensSteps[j] - g_sens) < 0.01) k = j;
-                    g_sens = kSensSteps[(k + 1) % 6]; show(bb);
-                    [NSUserDefaults.standardUserDefaults setDouble:g_sens forKey:@"sens"];
-                };
-                (void)idx;
-            } else {                    // GYRO: toggle
-                void (^show)(RTActionButton *) = ^(RTActionButton *bb) {
-                    [bb setTitle:atomic_load(&g_gyro_on) ? @"GYRO\non" : @"GYRO\noff" forState:UIControlStateNormal];
-                    bb.backgroundColor = [UIColor colorWithWhite:1 alpha:atomic_load(&g_gyro_on) ? 0.5 : 0.22];
-                };
-                show(b);
-                b.tap = ^(RTActionButton *bb) {
-                    atomic_store(&g_gyro_on, !atomic_load(&g_gyro_on)); show(bb);
-                    [NSUserDefaults.standardUserDefaults setBool:atomic_load(&g_gyro_on) forKey:@"gyro"];
-                };
-            }
-        }
-        [v addSubview:b]; [bs addObject:b]; [os addObject:[NSValue valueWithCGPoint:CGPointMake(defs[i].x, defs[i].y)]];
-    }
-    v.buttons = bs; v.offsets = os;
-    g_controls = v;
-    [g_root.view addSubview:v];
-    [NSLayoutConstraint activateConstraints:@[
-        [v.leadingAnchor constraintEqualToAnchor:g_root.view.leadingAnchor], [v.trailingAnchor constraintEqualToAnchor:g_root.view.trailingAnchor],
-        [v.topAnchor constraintEqualToAnchor:g_root.view.topAnchor], [v.bottomAnchor constraintEqualToAnchor:g_root.view.bottomAnchor]]];
+    CGFloat diameter = self.bounds.size.width;
+    self.layer.cornerRadius = diameter / 2;
+    CGFloat size = diameter * 0.4;
+    self.knob.bounds = CGRectMake(0, 0, size, size);
+    self.knob.layer.cornerRadius = size / 2;
+    self.knob.center = CGPointMake(diameter / 2, diameter / 2);
 }
 
+- (void)setDirs:(int)dirs {
+    static const int mac[] = { 13, 0, 1, 2 };   // W A S D
+    for (int i = 0; i < 4; i++) {
+        if ((dirs ^ _dirs) & (1 << i)) touch_key(mac[i], 0, !!(dirs & (1 << i)));
+    }
+    _dirs = dirs;
+}
+
+- (void)updateFromOffset:(CGPoint)offset {
+    CGFloat radius = self.bounds.size.width / 2;
+    if (radius <= 0) return;
+    CGFloat x = offset.x / radius, y = offset.y / radius, length = hypot(x, y);
+    if (length > 1) { x /= length; y /= length; }
+    CGFloat travel = radius - self.knob.bounds.size.width / 2;
+    self.knob.center = CGPointMake(radius + x * travel, radius + y * travel);
+    self.dirs = (y < -0.38 ? 1 : 0) | (x < -0.38 ? 2 : 0) | (y > 0.38 ? 4 : 0) | (x > 0.38 ? 8 : 0);
+}
+@end
+
+typedef struct {
+    const char *identifier, *title;
+    ActKind kind;
+    int code, arg;
+    uint16_t character;
+    CGFloat width, height;
+    BOOL menu;
+} RTTouchControl;
+
+static const RTTouchControl kTouchControls[] = {
+    {"escape", "Esc", ACT_KEY, 53, 0, 0x1B, 22, 18, YES},
+    {"enter", "Enter", ACT_KEY, 36, 0, '\r', 22, 18, YES},
+    {"space", "Space", ACT_KEY, 49, 0, ' ', 22, 18, YES},
+    {"tab", "Tab", ACT_KEY, 48, 0, '\t', 22, 18, YES},
+    {"left", "◀", ACT_KEY, 123, 0, 0, 22, 18, YES},
+    {"up", "▲", ACT_KEY, 126, 0, 0, 22, 18, YES},
+    {"down", "▼", ACT_KEY, 125, 0, 0, 22, 18, YES},
+    {"right", "▶", ACT_KEY, 124, 0, 0, 22, 18, YES},
+    {"yes", "Y", ACT_KEY, 16, 0, 'y', 22, 18, YES},
+    {"no", "N", ACT_KEY, 45, 0, 'n', 22, 18, YES},
+    {"fire", "FIRE", ACT_MOUSE, 1, 0, 0, 52, 52, NO},
+    {"jump", "JUMP", ACT_KEY, 49, 0, 0, 37, 37, NO},
+    {"use", "USE", ACT_KEY, 14, 0, 0, 29, 29, NO},
+    {"melee", "MELEE", ACT_KEY, 3, 0, 0, 29, 29, NO},
+    {"altFire", "ALT\nFIRE", ACT_MOUSE, 2, 0, 0, 33, 33, NO},
+    {"useEquipment", "USE\nEQUIP", ACT_MOUSE, 4, 0, 0, 33, 33, NO},
+    {"chainsaw", "CHAIN\nSAW", ACT_KEY, 5, 0, 0, 29, 29, NO},
+    {"swap", "SWAP\nWHEEL", ACT_KEY, 12, 0, 0, 29, 29, NO},
+    {"nextEquipment", "NEXT\nEQUIP", ACT_KEY, 122, 0, 0, 29, 29, NO},
+    {"weaponUp", "WPN\n▲", ACT_WHEEL, 0, 120, 0, 26, 26, NO},
+    {"weaponDown", "WPN\n▼", ACT_WHEEL, 0, -120, 0, 26, 26, NO},
+    {"sensitivity", "SENS", ACT_CUSTOM, 0, 0, 0, 26, 26, NO},
+    {"gyro", "GYRO", ACT_CUSTOM, 1, 0, 0, 26, 26, NO},
+};
+enum { kMenuCount = 10, kStickIndex = sizeof kTouchControls / sizeof *kTouchControls, kControlCount };
+static NSString *const kTouchDefaultsKey = @"touchLayout";
+static const CGFloat kDefaultOpacity = 0.82, kMinimumOpacity = 0.55;
+
+static NSString *control_id(NSUInteger index) {
+    return index == kStickIndex ? @"movement" : [NSString stringWithUTF8String:kTouchControls[index].identifier];
+}
+
+static CGRect control_hit_frame(NSUInteger index, CGRect frame) {
+    // Include every position the floating base can occupy.
+    return index == kStickIndex ? CGRectInset(frame, -g_stick_float, -g_stick_float) : touch_bounds(frame, g_touch_target);
+}
+
+static BOOL valid_control_frame(NSUInteger index, CGRect frame, CGRect area, const CGRect frames[]) {
+    CGRect hit = control_hit_frame(index, frame);
+    if (!CGRectContainsRect(area, hit)) return NO;
+    for (NSUInteger other = 0; other < kControlCount; other++) {
+        if (other != index && !CGRectIsNull(frames[other]) &&
+            CGRectIntersectsRect(CGRectInset(hit, -g_touch_target / 22, -g_touch_target / 22),
+                                 control_hit_frame(other, frames[other]))) return NO;
+    }
+    return YES;
+}
+
+@interface RTControlsView : UIView
+@property(nonatomic, strong) NSArray<RTActionButton *> *buttons;
+@property(nonatomic, strong) RTStick *stick;
+@property(nonatomic, strong) UIButton *editButton, *visibilityButton, *resetButton;
+@property(nonatomic, strong) UISlider *opacitySlider;
+@property(nonatomic, strong) UIView *selectionBorder, *resizeHandle;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSArray<NSNumber *> *> *positions;
+@property(nonatomic) CGFloat opacity;
+- (void)refresh;
+- (void)cancelInput;
+@end
+
+@implementation RTControlsView {
+    CGRect _frames[kControlCount];
+    CGRect _area;
+    NSInteger _selected;
+    __weak UITouch *_editorTouch, *_stickTouch;
+    CGPoint _start, _stickOrigin;
+    CGRect _initialFrame;
+    BOOL _resizing, _usingSavedLayout;
+    CGFloat _scale;
+}
+
+static UIButton *toolbar_button(NSString *title) {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    [button setTitle:title forState:UIControlStateNormal];
+    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    button.exclusiveTouch = NO;
+    button.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    button.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.75];
+    button.layer.cornerRadius = 10;
+    return button;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if (!(self = [super initWithFrame:frame])) return nil;
+    self.multipleTouchEnabled = YES;
+    _selected = -1;
+    _opacity = kDefaultOpacity;
+    _positions = [NSMutableDictionary dictionary];
+    NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:kTouchDefaultsKey];
+    if ([saved[@"version"] isEqual:@1]) {
+        NSDictionary *positions = saved[@"positions"];
+        if ([positions isKindOfClass:NSDictionary.class]) [_positions addEntriesFromDictionary:positions];
+        NSNumber *opacity = saved[@"opacity"], *hidden = saved[@"hidden"];
+        if ([opacity isKindOfClass:NSNumber.class] && isfinite(opacity.doubleValue))
+            _opacity = bounded(opacity.doubleValue, kMinimumOpacity, 1);
+        if ([hidden isKindOfClass:NSNumber.class]) g_touch_hidden = hidden.boolValue;
+    }
+    NSMutableArray *buttons = [NSMutableArray arrayWithCapacity:kStickIndex];
+    for (NSUInteger i = 0; i < kStickIndex; i++) {
+        const RTTouchControl *control = &kTouchControls[i];
+        RTActionButton *button = [RTActionButton buttonWithType:UIButtonTypeCustom];
+        button.exclusiveTouch = NO;
+        button.kind = control->kind;
+        button.code = control->code;
+        button.arg = control->arg;
+        button.character = control->character;
+        [button setTitle:[NSString stringWithUTF8String:control->title] forState:UIControlStateNormal];
+        [button updateTitle];
+        [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        [button setTitleColor:[UIColor colorWithRed:1 green:0.74 blue:0.47 alpha:1] forState:UIControlStateHighlighted];
+        button.titleLabel.numberOfLines = 2;
+        button.titleLabel.textAlignment = NSTextAlignmentCenter;
+        button.titleLabel.adjustsFontSizeToFitWidth = YES;
+        button.titleLabel.minimumScaleFactor = 0.65;
+        button.layer.borderWidth = 1;
+        button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.45].CGColor;
+        [button addTarget:button action:@selector(pressed) forControlEvents:UIControlEventTouchDown];
+        [button addTarget:button action:@selector(released) forControlEvents:UIControlEventTouchUpInside];
+        [button addTarget:button action:@selector(cancelInput) forControlEvents:UIControlEventTouchCancel | UIControlEventTouchUpOutside];
+        [self addSubview:button];
+        [buttons addObject:button];
+    }
+    self.buttons = buttons;
+    self.stick = [RTStick new];
+    self.stick.userInteractionEnabled = NO;
+    self.stick.layer.borderWidth = 1.5;
+    self.stick.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.45].CGColor;
+    self.stick.knob = [UIView new];
+    [self.stick addSubview:self.stick.knob];
+    [self addSubview:self.stick];
+
+    self.selectionBorder = [UIView new];
+    self.selectionBorder.userInteractionEnabled = NO;
+    self.selectionBorder.layer.borderWidth = 1.5;
+    self.selectionBorder.layer.borderColor = UIColor.systemOrangeColor.CGColor;
+    self.selectionBorder.layer.cornerRadius = 7;
+    [self addSubview:self.selectionBorder];
+    self.resizeHandle = [UIView new];
+    self.resizeHandle.userInteractionEnabled = NO;
+    self.resizeHandle.backgroundColor = UIColor.systemOrangeColor;
+    self.resizeHandle.layer.cornerRadius = 5;
+    [self addSubview:self.resizeHandle];
+
+    self.editButton = toolbar_button(@"EDIT");
+    self.visibilityButton = toolbar_button(@"NASCONDI");
+    self.resetButton = toolbar_button(@"RESET");
+    [self.editButton addTarget:self action:@selector(toggleEditing) forControlEvents:UIControlEventTouchUpInside];
+    [self.visibilityButton addTarget:self action:@selector(toggleVisibility) forControlEvents:UIControlEventTouchUpInside];
+    [self.resetButton addTarget:self action:@selector(resetLayout) forControlEvents:UIControlEventTouchUpInside];
+    self.opacitySlider = [UISlider new];
+    self.opacitySlider.minimumValue = kMinimumOpacity;
+    self.opacitySlider.maximumValue = 1;
+    self.opacitySlider.value = self.opacity;
+    self.opacitySlider.accessibilityLabel = @"Opacità";
+    self.opacitySlider.minimumTrackTintColor = UIColor.systemOrangeColor;
+    [self.opacitySlider addTarget:self action:@selector(changeOpacity) forControlEvents:UIControlEventValueChanged];
+    for (UIView *view in @[self.editButton, self.visibilityButton, self.resetButton, self.opacitySlider])
+        [self addSubview:view];
+    [self refresh];
+    return self;
+}
+
+- (void)savePreferences {
+    [NSUserDefaults.standardUserDefaults setObject:@{
+        @"version": @1, @"positions": self.positions, @"opacity": @(self.opacity), @"hidden": @(g_touch_hidden)
+    } forKey:kTouchDefaultsKey];
+}
+
+- (void)toggleEditing {
+    atomic_store(&g_touch_gyro_active, NO);
+    cancel_touch_input();
+    g_touch_editing = !g_touch_editing;
+    _selected = -1;
+    [self refresh];
+}
+
+- (void)toggleVisibility {
+    atomic_store(&g_touch_gyro_active, NO);
+    cancel_touch_input();
+    g_touch_hidden = !g_touch_hidden;
+    g_touch_editing = NO;
+    _selected = -1;
+    [self savePreferences];
+    [self refresh];
+}
+
+- (void)resetLayout {
+    [self cancelInput];
+    [self.positions removeAllObjects];
+    _selected = -1;
+    self.opacity = kDefaultOpacity;
+    self.opacitySlider.value = self.opacity;
+    [self savePreferences];
+    [self refresh];
+}
+
+- (void)changeOpacity {
+    self.opacity = self.opacitySlider.value;
+    [self savePreferences];
+    [self refresh];
+}
+
+- (void)refresh {
+    BOOL gameplay = atomic_load(&g_pointer_locked);
+    for (NSUInteger i = 0; i < self.buttons.count; i++) {
+        RTActionButton *button = self.buttons[i];
+        button.hidden = g_touch_hidden || (!g_touch_editing && !gameplay && !kTouchControls[i].menu);
+        button.userInteractionEnabled = !g_touch_editing && g_touch_active;
+        button.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.85];
+        button.layer.opacity = self.opacity;
+    }
+    self.stick.hidden = g_touch_hidden || (!gameplay && !g_touch_editing);
+    self.stick.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.75];
+    self.stick.knob.backgroundColor = [UIColor colorWithWhite:1 alpha:0.76];
+    self.stick.layer.opacity = self.opacity;
+    self.editButton.hidden = g_touch_hidden;
+    self.resetButton.hidden = self.opacitySlider.hidden = !g_touch_editing;
+    [self.editButton setTitle:g_touch_editing ? @"DONE" : @"EDIT" forState:UIControlStateNormal];
+    [self.visibilityButton setTitle:g_touch_hidden ? @"MOSTRA" : @"NASCONDI" forState:UIControlStateNormal];
+    self.visibilityButton.alpha = g_touch_hidden ? 0.72 : 1;
+    atomic_store(&g_touch_gyro_active, g_touch_active && gameplay && !g_touch_hidden && !g_touch_editing);
+    [self setNeedsLayout];
+}
+
+- (CGSize)controlSize:(NSUInteger)index {
+    return index == kStickIndex ? CGSizeMake(75 * _scale, 75 * _scale)
+        : CGSizeMake(kTouchControls[index].width * _scale, kTouchControls[index].height * _scale);
+}
+
+- (CGRect)frameForControl:(NSUInteger)index center:(CGPoint)center size:(CGSize)size {
+    CGRect frame = CGRectMake(center.x - size.width / 2, center.y - size.height / 2, size.width, size.height);
+    CGRect hit = control_hit_frame(index, frame);
+    if (hit.size.width > _area.size.width || hit.size.height > _area.size.height) return CGRectNull;
+    frame.origin.x += bounded(hit.origin.x, CGRectGetMinX(_area), CGRectGetMaxX(_area) - hit.size.width) - hit.origin.x;
+    frame.origin.y += bounded(hit.origin.y, CGRectGetMinY(_area), CGRectGetMaxY(_area) - hit.size.height) - hit.origin.y;
+    return frame;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGRect safe = self.safeAreaLayoutGuide.layoutFrame;
+    CGFloat left = CGRectGetMinX(safe), top = CGRectGetMinY(safe), right = CGRectGetMaxX(safe);
+    self.visibilityButton.frame = CGRectMake(right - 78, top, 78, 44);
+    self.editButton.frame = CGRectMake(right - 136, top, 54, 44);
+    self.resetButton.frame = CGRectMake(left, top, 62, 44);
+    self.opacitySlider.frame = CGRectMake(left + 72, top, fmin(155, fmax(44, safe.size.width - 216)), 44);
+
+    CGRect area = UIEdgeInsetsInsetRect(safe, UIEdgeInsetsMake(48, 4, 4, 4));
+    if (area.size.width <= 0 || area.size.height <= 0) return;
+    if (!CGRectEqualToRect(_area, area)) {
+        _area = area;
+        cancel_touch_input();
+    } else if (_editorTouch) {
+        return;   // a toolbar update must not reset the frame being dragged
+    }
+    BOOL compact = area.size.width < 470 || area.size.height < 244;
+    _scale = compact ? fmin(1, fmin(area.size.width / 540, area.size.height / 160))
+                     : fmin(1, fmin(area.size.width / 490, area.size.height / 302));
+    g_touch_target = compact ? 44 * _scale : 44;
+    g_stick_float = 8 * _scale;
+    CGRect defaults[kControlCount];
+    CGRect saved[kControlCount];
+    for (NSUInteger i = 0; i < kControlCount; i++) {
+        CGPoint center;
+        if (compact) {
+            CGFloat stickColumn = 104 * _scale;
+            if (i == kStickIndex) {
+                center = CGPointMake(CGRectGetMinX(area) + stickColumn / 2,
+                                     CGRectGetMaxY(area) - 52 * _scale);
+            } else {
+                CGFloat column = (area.size.width - stickColumn) / 8;
+                center = CGPointMake(CGRectGetMinX(area) + stickColumn + (i % 8 + 0.5) * column,
+                                     CGRectGetMinY(area) + (i / 8 + 0.5) * area.size.height / 3);
+            }
+        } else if (i < kMenuCount) {
+            center = CGPointMake(CGRectGetMinX(area) + 22 + (area.size.width - 44) * i / (kMenuCount - 1),
+                                 CGRectGetMinY(area) + 22);
+        } else if (i == kStickIndex) {
+            center = CGPointMake(CGRectGetMinX(area) + 66 * _scale, CGRectGetMaxY(area) - 65 * _scale);
+        } else {
+            NSUInteger slot = i - kMenuCount;
+            CGFloat step = fmax(47, 58 * _scale);
+            center = CGPointMake(CGRectGetMaxX(area) - 31 - step * (slot % 4),
+                                 CGRectGetMaxY(area) - 28 - (slot / 4) * step);
+        }
+        CGSize size = [self controlSize:i];
+        defaults[i] = [self frameForControl:i center:center size:size];
+        saved[i] = defaults[i];
+        NSArray *entry = self.positions[control_id(i)];
+        if (![entry isKindOfClass:NSArray.class] || entry.count != 3 ||
+            ![entry[0] isKindOfClass:NSNumber.class] || ![entry[1] isKindOfClass:NSNumber.class] ||
+            ![entry[2] isKindOfClass:NSNumber.class]) continue;
+        double x = [entry[0] doubleValue], y = [entry[1] doubleValue], factor = [entry[2] doubleValue];
+        if (!isfinite(x) || !isfinite(y) || !isfinite(factor)) continue;
+        center = CGPointMake(CGRectGetMinX(area) + bounded(x, 0, 1) * area.size.width,
+                             CGRectGetMinY(area) + bounded(y, 0, 1) * area.size.height);
+        factor = bounded(factor, 0.8, 2.5);
+        saved[i] = [self frameForControl:i center:center size:CGSizeMake(size.width * factor, size.height * factor)];
+    }
+    _usingSavedLayout = YES;
+    for (NSUInteger i = 0; i < kControlCount; i++) {
+        if (CGRectIsNull(saved[i]) || !valid_control_frame(i, saved[i], area, saved)) {
+            _usingSavedLayout = NO;
+            break;
+        }
+    }
+    for (NSUInteger i = 0; i < kControlCount; i++) _frames[i] = _usingSavedLayout ? saved[i] : defaults[i];
+    [self applyFrames];
+}
+
+- (void)applyFrames {
+    for (NSUInteger i = 0; i < self.buttons.count; i++) {
+        RTActionButton *button = self.buttons[i];
+        CGRect frame = _frames[i];
+        button.frame = frame;
+        button.layer.cornerRadius = kTouchControls[i].menu ? fmin(8, frame.size.height / 3) : frame.size.width / 2;
+        button.titleLabel.font = [UIFont boldSystemFontOfSize:bounded(frame.size.width * 0.29, 7, 17)];
+    }
+    if (!_stickTouch) self.stick.frame = _frames[kStickIndex];
+    BOOL selected = g_touch_editing && _selected >= 0;
+    self.selectionBorder.hidden = self.resizeHandle.hidden = !selected;
+    if (selected) {
+        CGRect hit = control_hit_frame(_selected, _frames[_selected]);
+        self.selectionBorder.frame = hit;
+        self.resizeHandle.frame = CGRectMake(CGRectGetMaxX(hit) - 12, CGRectGetMaxY(hit) - 12, 10, 10);
+    }
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *target = [super hitTest:point withEvent:event];
+    if (target != self) return target;
+    if (g_touch_editing) return self;
+    return !self.stick.hidden && g_touch_active && CGRectContainsPoint(control_hit_frame(kStickIndex, _frames[kStickIndex]), point)
+        ? self : nil;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (!g_touch_active || g_touch_hidden) return;
+    UITouch *touch = touches.anyObject;
+    CGPoint point = [touch locationInView:self];
+    if (g_touch_editing) {
+        if (_editorTouch) return;
+        _resizing = _selected >= 0 && CGRectContainsPoint(self.selectionBorder.frame, point) &&
+                    CGRectContainsPoint(CGRectInset(self.resizeHandle.frame, -6, -6), point);
+        if (!_resizing) {
+            _selected = -1;
+            for (NSUInteger i = 0; i < kControlCount; i++) {
+                if (CGRectContainsPoint(control_hit_frame(i, _frames[i]), point)) { _selected = i; break; }
+            }
+        }
+        [self applyFrames];
+        if (_selected < 0) return;
+        _editorTouch = touch;
+        _start = point;
+        _initialFrame = _frames[_selected];
+        return;
+    }
+    if (_stickTouch || self.stick.hidden || !atomic_load(&g_key_hwnd)) return;
+    CGRect frame = _frames[kStickIndex];
+    CGFloat x = CGRectGetMidX(frame), y = CGRectGetMidY(frame);
+    self.stick.center = CGPointMake(bounded(point.x, x - g_stick_float, x + g_stick_float),
+                                    bounded(point.y, y - g_stick_float, y + g_stick_float));
+    _stickOrigin = point;
+    _stickTouch = touch;
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (_editorTouch && [touches containsObject:_editorTouch]) {
+        CGPoint point = [_editorTouch locationInView:self];
+        CGFloat dx = point.x - _start.x, dy = point.y - _start.y;
+        CGPoint center = CGPointMake(CGRectGetMidX(_initialFrame), CGRectGetMidY(_initialFrame));
+        CGSize size = _initialFrame.size;
+        CGSize base = [self controlSize:_selected];
+        if (_resizing) {
+            // Project the drag onto the lower-right corner's direction of travel.
+            CGFloat factor = size.width / base.width;
+            factor += 2 * (dx * base.width + dy * base.height) /
+                      (base.width * base.width + base.height * base.height);
+            factor = bounded(factor, 0.8, 2.5);
+            size = CGSizeMake(base.width * factor, base.height * factor);
+        } else {
+            center.x += dx;
+            center.y += dy;
+        }
+        CGRect next = [self frameForControl:_selected center:center size:size];
+        if (!CGRectIsNull(next) && valid_control_frame(_selected, next, _area, _frames)) {
+            _frames[_selected] = next;
+            [self applyFrames];
+        }
+    } else if (_stickTouch && [touches containsObject:_stickTouch]) {
+        CGPoint point = [_stickTouch locationInView:self];
+        [self.stick updateFromOffset:CGPointMake(point.x - _stickOrigin.x, point.y - _stickOrigin.y)];
+    }
+}
+
+- (void)finishTouches:(NSSet<UITouch *> *)touches save:(BOOL)save {
+    if (_editorTouch && [touches containsObject:_editorTouch]) {
+        _editorTouch = nil;
+        CGRect frame = _frames[_selected];
+        if (save && !CGRectEqualToRect(frame, _initialFrame)) {
+            if (!_usingSavedLayout) {
+                [self.positions removeAllObjects];
+                _usingSavedLayout = YES;
+            }
+            self.positions[control_id(_selected)] = @[
+                @((CGRectGetMidX(frame) - CGRectGetMinX(_area)) / _area.size.width),
+                @((CGRectGetMidY(frame) - CGRectGetMinY(_area)) / _area.size.height),
+                @(frame.size.width / [self controlSize:_selected].width)
+            ];
+            [self savePreferences];
+        } else if (!save) {
+            _frames[_selected] = _initialFrame;
+            [self applyFrames];
+        }
+    }
+    if (_stickTouch && [touches containsObject:_stickTouch]) {
+        _stickTouch = nil;
+        [self.stick updateFromOffset:CGPointZero];
+        self.stick.frame = _frames[kStickIndex];
+    }
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self finishTouches:touches save:YES]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self finishTouches:touches save:NO]; }
+
+- (void)cancelInput {
+    for (RTActionButton *button in self.buttons) [button cancelInput];
+    if (_editorTouch) {
+        _editorTouch = nil;
+        _frames[_selected] = _initialFrame;
+    }
+    _stickTouch = nil;
+    self.stick.dirs = 0;
+    [self.stick updateFromOffset:CGPointZero];
+    [self setNeedsLayout];
+}
+@end
+
+static void overlay_front(void) {
+    if (g_controls) [g_root.view bringSubviewToFront:g_controls];
+}
+
+static void update_touch_controls(void) {
+    [(RTControlsView *)g_controls refresh];
+}
+
+static void cancel_touch_input(void) {
+    g_touch_epoch++;
+    for (RTView *view in g_views) view.tracking = nil;
+    if (g_menu_enter_hwnd) {
+        g_menu_enter_hwnd = 0;
+        touch_key(36, '\r', 0);
+    }
+    [(RTControlsView *)g_controls cancelInput];
+}
+
+static void build_controls(void) {
+    RTControlsView *view = [[RTControlsView alloc] initWithFrame:g_root.view.bounds];
+    view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    g_controls = view;
+    [g_root.view addSubview:view];
+}
 
 // ---------------- gyro aiming ----------------
 // Turning the phone about the world's vertical axis turns the view; tilting it about the screen's horizontal axis
@@ -632,10 +1031,22 @@ static void start_gyro(void) {
     if (!g_motion.deviceMotionAvailable) { rt_log("[cocoa] no gyro\n"); return; }
     g_motion.deviceMotionUpdateInterval = 1.0 / 120;
     static double accx, accy, lastT;
-    [g_motion startDeviceMotionUpdatesToQueue:[NSOperationQueue new] withHandler:^(CMDeviceMotion *m, NSError *err) {
+    static NSUInteger lastEpoch;
+    NSOperationQueue *motionQueue = [NSOperationQueue new];
+    motionQueue.maxConcurrentOperationCount = 1;
+    [g_motion startDeviceMotionUpdatesToQueue:motionQueue withHandler:^(CMDeviceMotion *m, NSError *err) {
         if (!m) return;
         double dt = lastT ? m.timestamp - lastT : 0; lastT = m.timestamp;
-        if (dt <= 0 || dt > 0.1 || !atomic_load(&g_gyro_on) || g_controls.hidden) return;
+        NSUInteger epoch = atomic_load(&g_touch_epoch);
+        if (epoch != lastEpoch) {
+            accx = accy = 0;
+            lastEpoch = epoch;
+        }
+        if (!atomic_load(&g_touch_gyro_active) || !atomic_load(&g_gyro_on)) {
+            accx = accy = 0;
+            return;
+        }
+        if (dt <= 0 || dt > 0.1) return;
         uint64_t hwnd = atomic_load(&g_key_hwnd); if (!hwnd) return;
         CMRotationRate r = m.rotationRate; CMAcceleration g = m.gravity;
         { static double px, py, pz; static int cnt; static double gx, gy, gz;   // diagnostics: peak rate per axis every 0.5 s
@@ -653,7 +1064,14 @@ static void start_gyro(void) {
         double k = 450.0 * g_sens * dt;                            // mouse counts per rad/s
         accx += -yaw * k; accy += pitch * k;
         int dx = (int)accx, dy = (int)accy; accx -= dx; accy -= dy;
-        if (dx || dy) mouse_motion(hwnd, dx, dy, clampi(atomic_load(&g_cx) + dx, 0, 4095), clampi(atomic_load(&g_cy) + dy, 0, 4095));
+        if (dx || dy) {
+            on_main(^{
+                if (epoch == atomic_load(&g_touch_epoch) && atomic_load(&g_touch_gyro_active) &&
+                    atomic_load(&g_gyro_on) && atomic_load(&g_pointer_locked) && hwnd == atomic_load(&g_key_hwnd))
+                    mouse_motion(hwnd, dx, dy, clampi(atomic_load(&g_cx) + dx, 0, 4095),
+                                                clampi(atomic_load(&g_cy) + dy, 0, 4095));
+            });
+        }
     }];
 }
 
@@ -680,9 +1098,11 @@ static void request_high_refresh(void) {
 void gamepad_start(void);
 void cocoa_ios_start(void) {
     cocoa_ios_screen_init();
-    build_overlay();
     request_high_refresh();
-    { NSUserDefaults *d = NSUserDefaults.standardUserDefaults; if ([d objectForKey:@"sens"]) g_sens = [d doubleForKey:@"sens"]; atomic_store(&g_gyro_on, [d boolForKey:@"gyro"]); }
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    double sensitivity = [defaults doubleForKey:@"sens"];
+    if (isfinite(sensitivity) && sensitivity >= 0.5 && sensitivity <= 3) g_sens = sensitivity;
+    atomic_store(&g_gyro_on, [defaults boolForKey:@"gyro"]);
     build_controls();
     start_gyro();
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
@@ -690,7 +1110,16 @@ void cocoa_ios_start(void) {
     [nc addObserverForName:GCKeyboardDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { attach_keyboard(n.object); }];
     for (GCMouse *m in GCMouse.mice) attach_mouse(m);
     [nc addObserverForName:GCMouseDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { attach_mouse(n.object); }];
-    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { rt_ios_gpu_pause(0); win_from_cocoa(0, WM_ACTIVATEAPP, 1, 0); }];
-    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { rt_ios_gpu_pause(1); win_from_cocoa(0, WM_ACTIVATEAPP, 0, 0); }];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        g_touch_active = YES;
+        update_touch_controls();
+        rt_ios_gpu_pause(0); win_from_cocoa(0, WM_ACTIVATEAPP, 1, 0);
+    }];
+    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+        g_touch_active = NO;
+        update_touch_controls();
+        cancel_touch_input();
+        rt_ios_gpu_pause(1); win_from_cocoa(0, WM_ACTIVATEAPP, 0, 0);
+    }];
     gamepad_start();
 }
