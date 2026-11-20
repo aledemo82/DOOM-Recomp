@@ -30,7 +30,7 @@ targets:
         includes: [game.c, native_idtech.c]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.yoshisuga.doom
+        PRODUCT_BUNDLE_IDENTIFIER: com.aledemo82.doomios
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_DEBUG_DYLIB: NO
         ENABLE_PREVIEWS: NO
