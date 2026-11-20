@@ -6,3 +6,7 @@
 1411021e7 C.rbx = 0x142343218ull;
 # ... and select entry (r_renderAPI - 1): with OpenGL gone, Vulkan (r_renderAPI 1) is entry 0.
 1411022c8 C.rdx = (uint32_t)((uint32_t)C.rax ? (uint32_t)C.rax - 1 : 0);
+# F_1419f4d40 allocates its 0x58-byte context via F_141b2bd78 -> F_141ec9fd0 -> HeapAlloc.
+# On initialization failure, free it on the same CRT heap. RDX holds the context at this
+# call site. The native HeapFree shim leaves RSP untouched, and execution resumes at 0x1419f4e8b.
+1419f4e88 C.r8 = C.rdx; C.rdx = 0; C.rcx = rd64(0x15389e120ull); I_kernel32_dll_HeapFree(c);
