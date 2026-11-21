@@ -39,9 +39,13 @@ static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gate_cv = PTHREAD_COND_INITIALIZER;
 static int gate_paused;
 static uint64_t next_present_ns;  // protected by gate_mu
+static uint64_t gate_generation;  // protected by gate_mu
 void rt_ios_gpu_pause(int paused) {
     pthread_mutex_lock(&gate_mu);
-    if (gate_paused != paused) next_present_ns = 0;
+    if (gate_paused != paused) {
+        next_present_ns = 0;
+        gate_generation++;
+    }
     gate_paused = paused;
     pthread_cond_broadcast(&gate_cv);
     pthread_mutex_unlock(&gate_mu);
@@ -56,8 +60,52 @@ static PFN_vkQueueSubmit real_submit;
 static PFN_vkQueuePresentKHR real_present;
 static PFN_vkAcquireNextImageKHR real_acquire;
 static VkResult wrap_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) { gate_wait(); return real_submit(q, n, si, f); }
+// CPU-side timings only. The driver can queue work after real_present returns.
+static pthread_once_t pacing_log_once = PTHREAD_ONCE_INIT;
+static int pacing_log_enabled;
+static _Thread_local uint64_t acquire_ns;
+static void init_pacing_log(void) { pacing_log_enabled = getenv("RT_FPS") != NULL; }
+
+static void log_pacing(uint64_t generation, uint64_t arrival, uint64_t admitted, uint64_t complete) {
+    static _Thread_local uint64_t last_generation, last_admitted, last_complete;
+    static _Thread_local uint64_t start, cap, driver, acquire, other, max_interval;
+    static _Thread_local unsigned intervals;
+
+    if (last_generation != generation || !last_complete || arrival < last_complete) {
+        start = admitted;
+        cap = driver = acquire = other = max_interval = 0;
+        intervals = 0;
+    } else {
+        uint64_t interval = admitted - last_admitted;
+        if (interval > max_interval) max_interval = interval;
+        cap += admitted - arrival;
+        driver += complete - admitted;
+        acquire += acquire_ns;
+        other += arrival - last_complete;
+        intervals++;
+        if (admitted - start >= 5000000000ull) {
+            double ms = 1e6 * intervals;
+            rt_log("[pacing ios] %.2f submits/s, peak gap %.2f ms | cap %.2f ms, "
+                   "present API %.2f ms, acquire API %.2f ms, rest incl. framework %.2f ms\n",
+                   intervals * 1e9 / (admitted - start), max_interval / 1e6,
+                   cap / ms, driver / ms, acquire / ms, (other > acquire ? other - acquire : 0) / ms);
+            start = admitted;
+            cap = driver = acquire = other = max_interval = 0;
+            intervals = 0;
+        }
+    }
+    last_generation = generation;
+    last_admitted = admitted;
+    last_complete = complete;
+    acquire_ns = 0;
+}
+
 static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) {
-    const uint64_t interval_ns = 25000000;  // 40 FPS
+    const uint64_t interval_ns = 25000000;  // 40 Hz schedule
+    pthread_once(&pacing_log_once, init_pacing_log);
+    uint64_t arrival = pacing_log_enabled ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    uint64_t waited_deadline = 0, waited_generation = 0;
+    uint64_t admitted, generation;
 
     pthread_mutex_lock(&gate_mu);
     for (;;) {
@@ -65,13 +113,22 @@ static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) {
 
         uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (now >= next_present_ns) {
-            // Rebase on this submission. A pause or late frame never builds up slots.
-            next_present_ns = now + interval_ns;
+            // Keep the 25 ms phase through small timer wake-up jitter. If work was
+            // late on arrival or the wake-up missed by more than 10%, start a new phase.
+            uint64_t slot = now;
+            if (waited_deadline && waited_deadline == next_present_ns &&
+                waited_generation == gate_generation && now - waited_deadline <= interval_ns / 10)
+                slot = waited_deadline;
+            next_present_ns = slot + interval_ns;
+            admitted = now;
+            generation = gate_generation;
             break;
         }
 
-        // Darwin's relative wait releases gate_mu so activation changes can wake us.
-        struct timespec remaining = { .tv_nsec = (long)(next_present_ns - now) };
+        // The relative wait releases the lock. Recheck both predicates on wake-up.
+        waited_deadline = next_present_ns;
+        waited_generation = gate_generation;
+        struct timespec remaining = { .tv_nsec = (long)(waited_deadline - now) };
         int err = pthread_cond_timedwait_relative_np(&gate_cv, &gate_mu, &remaining);
         if (err && err != ETIMEDOUT) {
             pthread_mutex_unlock(&gate_mu);
@@ -82,9 +139,19 @@ static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) {
     pthread_mutex_unlock(&gate_mu);
 
     // The driver may block on the swapchain. Keep the lifecycle gate available.
-    return real_present(q, pi);
+    VkResult result = real_present(q, pi);
+    if (pacing_log_enabled) log_pacing(generation, arrival, admitted, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    return result;
 }
-static VkResult wrap_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t, VkSemaphore s, VkFence f, uint32_t *i) { gate_wait(); return real_acquire(d, sc, t, s, f, i); }
+
+static VkResult wrap_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t, VkSemaphore s, VkFence f, uint32_t *i) {
+    gate_wait();
+    pthread_once(&pacing_log_once, init_pacing_log);
+    uint64_t start = pacing_log_enabled ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    VkResult result = real_acquire(d, sc, t, s, f, i);
+    if (pacing_log_enabled) acquire_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start;
+    return result;
+}
 
 __attribute__((visibility("default"), used))
 PFN_void vkGetInstanceProcAddr(void *instance, const char *name) {

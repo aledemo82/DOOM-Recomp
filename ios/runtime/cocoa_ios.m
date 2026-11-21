@@ -591,7 +591,7 @@ static const RTTouchControl kTouchControls[] = {
 };
 enum { kMenuCount = 10, kStickIndex = sizeof kTouchControls / sizeof *kTouchControls, kControlCount };
 static NSString *const kTouchDefaultsKey = @"touchLayout";
-static const CGFloat kDefaultOpacity = 0.82, kMinimumOpacity = 0.55;
+static const CGFloat kDefaultOpacity = 0.82, kMinimumOpacity = 0.05;
 
 static NSString *control_id(NSUInteger index) {
     return index == kStickIndex ? @"movement" : [NSString stringWithUTF8String:kTouchControls[index].identifier];
@@ -602,37 +602,38 @@ static CGRect control_hit_frame(NSUInteger index, CGRect frame) {
     return index == kStickIndex ? CGRectInset(frame, -g_stick_float, -g_stick_float) : touch_bounds(frame, g_touch_target);
 }
 
-static BOOL valid_control_frame(NSUInteger index, CGRect frame, CGRect area, const CGRect frames[]) {
-    CGRect hit = control_hit_frame(index, frame);
-    if (!CGRectContainsRect(area, hit)) return NO;
-    for (NSUInteger other = 0; other < kControlCount; other++) {
-        if (other != index && !CGRectIsNull(frames[other]) &&
-            CGRectIntersectsRect(CGRectInset(hit, -g_touch_target / 22, -g_touch_target / 22),
-                                 control_hit_frame(other, frames[other]))) return NO;
-    }
-    return YES;
+static CGRect fitted_control_frame(NSUInteger index, CGPoint center, CGSize size,
+                                   CGRect area, BOOL fitHitTarget) {
+    CGRect frame = CGRectMake(center.x - size.width / 2, center.y - size.height / 2, size.width, size.height);
+    CGRect limit = fitHitTarget ? control_hit_frame(index, frame) : frame;
+    if (limit.size.width > area.size.width || limit.size.height > area.size.height) return CGRectNull;
+    frame.origin.x += bounded(limit.origin.x, CGRectGetMinX(area), CGRectGetMaxX(area) - limit.size.width) - limit.origin.x;
+    frame.origin.y += bounded(limit.origin.y, CGRectGetMinY(area), CGRectGetMaxY(area) - limit.size.height) - limit.origin.y;
+    return frame;
 }
 
 @interface RTControlsView : UIView
 @property(nonatomic, strong) NSArray<RTActionButton *> *buttons;
 @property(nonatomic, strong) RTStick *stick;
-@property(nonatomic, strong) UIButton *editButton, *visibilityButton, *resetButton;
+@property(nonatomic, strong) UIButton *editButton, *visibilityButton, *resetButton, *controlPicker;
 @property(nonatomic, strong) UISlider *opacitySlider;
 @property(nonatomic, strong) UIView *selectionBorder, *resizeHandle;
+@property(nonatomic, strong) UILabel *moveHandle;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSArray<NSNumber *> *> *positions;
 @property(nonatomic) CGFloat opacity;
 - (void)refresh;
 - (void)cancelInput;
+- (void)selectControl:(NSUInteger)index;
 @end
 
 @implementation RTControlsView {
     CGRect _frames[kControlCount];
-    CGRect _area;
+    CGRect _area, _defaultArea, _handleArea;
     NSInteger _selected;
     __weak UITouch *_editorTouch, *_stickTouch;
     CGPoint _start, _stickOrigin;
     CGRect _initialFrame;
-    BOOL _resizing, _usingSavedLayout;
+    BOOL _resizing;
     CGFloat _scale;
 }
 
@@ -654,7 +655,7 @@ static UIButton *toolbar_button(NSString *title) {
     _opacity = kDefaultOpacity;
     _positions = [NSMutableDictionary dictionary];
     NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:kTouchDefaultsKey];
-    if ([saved[@"version"] isEqual:@1]) {
+    if ([saved[@"version"] isEqual:@1] || [saved[@"version"] isEqual:@2]) {
         NSDictionary *positions = saved[@"positions"];
         if ([positions isKindOfClass:NSDictionary.class]) [_positions addEntriesFromDictionary:positions];
         NSNumber *opacity = saved[@"opacity"], *hidden = saved[@"hidden"];
@@ -708,6 +709,29 @@ static UIButton *toolbar_button(NSString *title) {
     self.resizeHandle.layer.cornerRadius = 5;
     [self addSubview:self.resizeHandle];
 
+    self.moveHandle = [UILabel new];
+    self.moveHandle.text = @"↔";
+    self.moveHandle.textAlignment = NSTextAlignmentCenter;
+    self.moveHandle.textColor = UIColor.blackColor;
+    self.moveHandle.backgroundColor = UIColor.systemOrangeColor;
+    self.moveHandle.layer.cornerRadius = 13;
+    self.moveHandle.clipsToBounds = YES;
+    self.moveHandle.userInteractionEnabled = NO;
+    [self addSubview:self.moveHandle];
+
+    self.controlPicker = toolbar_button(@"CONTROLLI");
+    self.controlPicker.showsMenuAsPrimaryAction = YES;
+    NSMutableArray<UIAction *> *choices = [NSMutableArray arrayWithCapacity:kControlCount];
+    __weak RTControlsView *weakSelf = self;
+    for (NSUInteger i = 0; i < kControlCount; i++) {
+        NSString *title = i == kStickIndex ? @"Joystick" :
+            [[NSString stringWithUTF8String:kTouchControls[i].title] stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        [choices addObject:[UIAction actionWithTitle:title image:nil identifier:nil handler:^(__kindof UIAction *action) {
+            [weakSelf selectControl:i];
+        }]];
+    }
+    self.controlPicker.menu = [UIMenu menuWithTitle:@"" children:choices];
+
     self.editButton = toolbar_button(@"EDIT");
     self.visibilityButton = toolbar_button(@"NASCONDI");
     self.resetButton = toolbar_button(@"RESET");
@@ -721,7 +745,7 @@ static UIButton *toolbar_button(NSString *title) {
     self.opacitySlider.accessibilityLabel = @"Opacità";
     self.opacitySlider.minimumTrackTintColor = UIColor.systemOrangeColor;
     [self.opacitySlider addTarget:self action:@selector(changeOpacity) forControlEvents:UIControlEventValueChanged];
-    for (UIView *view in @[self.editButton, self.visibilityButton, self.resetButton, self.opacitySlider])
+    for (UIView *view in @[self.editButton, self.visibilityButton, self.resetButton, self.controlPicker, self.opacitySlider])
         [self addSubview:view];
     [self refresh];
     return self;
@@ -729,7 +753,7 @@ static UIButton *toolbar_button(NSString *title) {
 
 - (void)savePreferences {
     [NSUserDefaults.standardUserDefaults setObject:@{
-        @"version": @1, @"positions": self.positions, @"opacity": @(self.opacity), @"hidden": @(g_touch_hidden)
+        @"version": @2, @"positions": self.positions, @"opacity": @(self.opacity), @"hidden": @(g_touch_hidden)
     } forKey:kTouchDefaultsKey];
 }
 
@@ -761,6 +785,12 @@ static UIButton *toolbar_button(NSString *title) {
     [self refresh];
 }
 
+- (void)selectControl:(NSUInteger)index {
+    if (!g_touch_editing || !g_touch_active || _editorTouch) return;
+    _selected = index;
+    [self applyFrames];
+}
+
 - (void)changeOpacity {
     self.opacity = self.opacitySlider.value;
     [self savePreferences];
@@ -781,7 +811,7 @@ static UIButton *toolbar_button(NSString *title) {
     self.stick.knob.backgroundColor = [UIColor colorWithWhite:1 alpha:0.76];
     self.stick.layer.opacity = self.opacity;
     self.editButton.hidden = g_touch_hidden;
-    self.resetButton.hidden = self.opacitySlider.hidden = !g_touch_editing;
+    self.resetButton.hidden = self.opacitySlider.hidden = self.controlPicker.hidden = !g_touch_editing;
     [self.editButton setTitle:g_touch_editing ? @"DONE" : @"EDIT" forState:UIControlStateNormal];
     [self.visibilityButton setTitle:g_touch_hidden ? @"MOSTRA" : @"NASCONDI" forState:UIControlStateNormal];
     self.visibilityButton.alpha = g_touch_hidden ? 0.72 : 1;
@@ -794,15 +824,6 @@ static UIButton *toolbar_button(NSString *title) {
         : CGSizeMake(kTouchControls[index].width * _scale, kTouchControls[index].height * _scale);
 }
 
-- (CGRect)frameForControl:(NSUInteger)index center:(CGPoint)center size:(CGSize)size {
-    CGRect frame = CGRectMake(center.x - size.width / 2, center.y - size.height / 2, size.width, size.height);
-    CGRect hit = control_hit_frame(index, frame);
-    if (hit.size.width > _area.size.width || hit.size.height > _area.size.height) return CGRectNull;
-    frame.origin.x += bounded(hit.origin.x, CGRectGetMinX(_area), CGRectGetMaxX(_area) - hit.size.width) - hit.origin.x;
-    frame.origin.y += bounded(hit.origin.y, CGRectGetMinY(_area), CGRectGetMaxY(_area) - hit.size.height) - hit.origin.y;
-    return frame;
-}
-
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGRect safe = self.safeAreaLayoutGuide.layoutFrame;
@@ -810,12 +831,17 @@ static UIButton *toolbar_button(NSString *title) {
     self.visibilityButton.frame = CGRectMake(right - 78, top, 78, 44);
     self.editButton.frame = CGRectMake(right - 136, top, 54, 44);
     self.resetButton.frame = CGRectMake(left, top, 62, 44);
-    self.opacitySlider.frame = CGRectMake(left + 72, top, fmin(155, fmax(44, safe.size.width - 216)), 44);
+    self.controlPicker.frame = CGRectMake(left + 66, top, 80, 44);
+    CGFloat sliderWidth = fmin(155, safe.size.width - 292);
+    self.opacitySlider.frame = sliderWidth >= 44 ? CGRectMake(left + 152, top, sliderWidth, 44)
+        : CGRectMake(left, top + 44, fmin(155, safe.size.width), 44);
+    _handleArea = UIEdgeInsetsInsetRect(safe, UIEdgeInsetsMake(sliderWidth >= 44 ? 48 : 92, 0, 0, 0));
 
     CGRect area = UIEdgeInsetsInsetRect(safe, UIEdgeInsetsMake(48, 4, 4, 4));
     if (area.size.width <= 0 || area.size.height <= 0) return;
-    if (!CGRectEqualToRect(_area, area)) {
-        _area = area;
+    if (!CGRectEqualToRect(_area, self.bounds) || !CGRectEqualToRect(_defaultArea, area)) {
+        _area = self.bounds;
+        _defaultArea = area;
         cancel_touch_input();
     } else if (_editorTouch) {
         return;   // a toolbar update must not reset the frame being dragged
@@ -825,8 +851,6 @@ static UIButton *toolbar_button(NSString *title) {
                      : fmin(1, fmin(area.size.width / 490, area.size.height / 302));
     g_touch_target = compact ? 44 * _scale : 44;
     g_stick_float = 8 * _scale;
-    CGRect defaults[kControlCount];
-    CGRect saved[kControlCount];
     for (NSUInteger i = 0; i < kControlCount; i++) {
         CGPoint center;
         if (compact) {
@@ -851,27 +875,24 @@ static UIButton *toolbar_button(NSString *title) {
                                  CGRectGetMaxY(area) - 28 - (slot / 4) * step);
         }
         CGSize size = [self controlSize:i];
-        defaults[i] = [self frameForControl:i center:center size:size];
-        saved[i] = defaults[i];
+        _frames[i] = fitted_control_frame(i, center, size, area, YES);
+        if (CGRectIsNull(_frames[i])) _frames[i] = fitted_control_frame(i, center, size, _area, NO);
         NSArray *entry = self.positions[control_id(i)];
-        if (![entry isKindOfClass:NSArray.class] || entry.count != 3 ||
+        if (![entry isKindOfClass:NSArray.class] || (entry.count != 3 && entry.count != 4) ||
             ![entry[0] isKindOfClass:NSNumber.class] || ![entry[1] isKindOfClass:NSNumber.class] ||
             ![entry[2] isKindOfClass:NSNumber.class]) continue;
         double x = [entry[0] doubleValue], y = [entry[1] doubleValue], factor = [entry[2] doubleValue];
         if (!isfinite(x) || !isfinite(y) || !isfinite(factor)) continue;
-        center = CGPointMake(CGRectGetMinX(area) + bounded(x, 0, 1) * area.size.width,
-                             CGRectGetMinY(area) + bounded(y, 0, 1) * area.size.height);
+        // Three-value entries retain their legacy safe-area coordinates until edited.
+        BOOL legacy = entry.count == 3;
+        CGRect reference = legacy ? area : _area;
+        center = CGPointMake(CGRectGetMinX(reference) + bounded(x, 0, 1) * reference.size.width,
+                             CGRectGetMinY(reference) + bounded(y, 0, 1) * reference.size.height);
         factor = bounded(factor, 0.8, 2.5);
-        saved[i] = [self frameForControl:i center:center size:CGSizeMake(size.width * factor, size.height * factor)];
+        CGRect saved = fitted_control_frame(i, center, CGSizeMake(size.width * factor, size.height * factor),
+                                           reference, legacy);
+        if (!CGRectIsNull(saved)) _frames[i] = saved;
     }
-    _usingSavedLayout = YES;
-    for (NSUInteger i = 0; i < kControlCount; i++) {
-        if (CGRectIsNull(saved[i]) || !valid_control_frame(i, saved[i], area, saved)) {
-            _usingSavedLayout = NO;
-            break;
-        }
-    }
-    for (NSUInteger i = 0; i < kControlCount; i++) _frames[i] = _usingSavedLayout ? saved[i] : defaults[i];
     [self applyFrames];
 }
 
@@ -885,20 +906,44 @@ static UIButton *toolbar_button(NSString *title) {
     }
     if (!_stickTouch) self.stick.frame = _frames[kStickIndex];
     BOOL selected = g_touch_editing && _selected >= 0;
-    self.selectionBorder.hidden = self.resizeHandle.hidden = !selected;
+    self.selectionBorder.hidden = self.resizeHandle.hidden = self.moveHandle.hidden = !selected;
     if (selected) {
-        CGRect hit = control_hit_frame(_selected, _frames[_selected]);
-        self.selectionBorder.frame = hit;
-        self.resizeHandle.frame = CGRectMake(CGRectGetMaxX(hit) - 12, CGRectGetMaxY(hit) - 12, 10, 10);
+        CGRect frame = _frames[_selected];
+        self.selectionBorder.frame = CGRectIntersection(control_hit_frame(_selected, frame), _area);
+        CGFloat maxX = CGRectGetMaxX(_handleArea), maxY = CGRectGetMaxY(_handleArea);
+        CGFloat minX = CGRectGetMinX(_handleArea), minY = CGRectGetMinY(_handleArea);
+        CGFloat x = bounded(CGRectGetMaxX(frame) - 5, minX + 8, maxX - 8);
+        CGFloat y = bounded(CGRectGetMaxY(frame) - 5, minY + 8, maxY - 8);
+        self.resizeHandle.frame = CGRectMake(x - 5, y - 5, 10, 10);
+        CGPoint center = CGPointMake(CGRectGetMidX(frame), CGRectGetMidY(frame));
+        self.moveHandle.hidden = CGRectContainsPoint(CGRectInset(_handleArea, 13, 13), center);
+        if (!self.moveHandle.hidden) {
+            CGFloat moveX = bounded(center.x, minX + 13, maxX - 13);
+            CGFloat moveY = bounded(center.y, minY + 13, maxY - 13);
+            if (fabs(moveX - x) < 26 && fabs(moveY - y) < 26)
+                moveY = y < CGRectGetMidY(_handleArea) ? y + 27 : y - 27;
+            self.moveHandle.frame = CGRectMake(moveX - 13, moveY - 13, 26, 26);
+        }
     }
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *target = [super hitTest:point withEvent:event];
+    if ([target isKindOfClass:RTActionButton.class] && ((RTActionButton *)target).tracking) {
+        // A second finger can reach the next button in the stack. UIKit keeps the
+        // first finger bound to its original view for the lifetime of that touch.
+        target = self;
+        for (RTActionButton *button in self.buttons.reverseObjectEnumerator) {
+            if (button.tracking) continue;
+            UIView *hit = [button hitTest:[self convertPoint:point toView:button] withEvent:event];
+            if (hit) return hit;
+        }
+    }
     if (target != self) return target;
     if (g_touch_editing) return self;
-    return !self.stick.hidden && g_touch_active && CGRectContainsPoint(control_hit_frame(kStickIndex, _frames[kStickIndex]), point)
-        ? self : nil;
+    // Toolbar and unoccupied buttons take priority over the joystick.
+    return !_stickTouch && !self.stick.hidden && g_touch_active &&
+           CGRectContainsPoint(control_hit_frame(kStickIndex, _frames[kStickIndex]), point) ? self : nil;
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
@@ -907,13 +952,17 @@ static UIButton *toolbar_button(NSString *title) {
     CGPoint point = [touch locationInView:self];
     if (g_touch_editing) {
         if (_editorTouch) return;
-        _resizing = _selected >= 0 && CGRectContainsPoint(self.selectionBorder.frame, point) &&
-                    CGRectContainsPoint(CGRectInset(self.resizeHandle.frame, -6, -6), point);
-        if (!_resizing) {
+        _resizing = _selected >= 0 && CGRectContainsPoint(CGRectInset(self.resizeHandle.frame, -6, -6), point);
+        BOOL move = !self.moveHandle.hidden && CGRectContainsPoint(self.moveHandle.frame, point);
+        if (!_resizing && !move &&
+            (_selected < 0 || !CGRectContainsPoint(control_hit_frame(_selected, _frames[_selected]), point))) {
             _selected = -1;
-            for (NSUInteger i = 0; i < kControlCount; i++) {
+            // Match gameplay: buttons use their front-to-back UIKit order, then the joystick.
+            for (NSInteger i = kStickIndex - 1; i >= 0; i--) {
                 if (CGRectContainsPoint(control_hit_frame(i, _frames[i]), point)) { _selected = i; break; }
             }
+            if (_selected < 0 && CGRectContainsPoint(control_hit_frame(kStickIndex, _frames[kStickIndex]), point))
+                _selected = kStickIndex;
         }
         [self applyFrames];
         if (_selected < 0) return;
@@ -925,8 +974,11 @@ static UIButton *toolbar_button(NSString *title) {
     if (_stickTouch || self.stick.hidden || !atomic_load(&g_key_hwnd)) return;
     CGRect frame = _frames[kStickIndex];
     CGFloat x = CGRectGetMidX(frame), y = CGRectGetMidY(frame);
-    self.stick.center = CGPointMake(bounded(point.x, x - g_stick_float, x + g_stick_float),
-                                    bounded(point.y, y - g_stick_float, y + g_stick_float));
+    CGFloat half = frame.size.width / 2;
+    self.stick.center = CGPointMake(bounded(bounded(point.x, x - g_stick_float, x + g_stick_float),
+                                           CGRectGetMinX(_area) + half, CGRectGetMaxX(_area) - half),
+                                    bounded(bounded(point.y, y - g_stick_float, y + g_stick_float),
+                                           CGRectGetMinY(_area) + half, CGRectGetMaxY(_area) - half));
     _stickOrigin = point;
     _stickTouch = touch;
 }
@@ -949,8 +1001,8 @@ static UIButton *toolbar_button(NSString *title) {
             center.x += dx;
             center.y += dy;
         }
-        CGRect next = [self frameForControl:_selected center:center size:size];
-        if (!CGRectIsNull(next) && valid_control_frame(_selected, next, _area, _frames)) {
+        CGRect next = fitted_control_frame(_selected, center, size, _area, NO);
+        if (!CGRectIsNull(next)) {
             _frames[_selected] = next;
             [self applyFrames];
         }
@@ -965,14 +1017,10 @@ static UIButton *toolbar_button(NSString *title) {
         _editorTouch = nil;
         CGRect frame = _frames[_selected];
         if (save && !CGRectEqualToRect(frame, _initialFrame)) {
-            if (!_usingSavedLayout) {
-                [self.positions removeAllObjects];
-                _usingSavedLayout = YES;
-            }
             self.positions[control_id(_selected)] = @[
                 @((CGRectGetMidX(frame) - CGRectGetMinX(_area)) / _area.size.width),
                 @((CGRectGetMidY(frame) - CGRectGetMinY(_area)) / _area.size.height),
-                @(frame.size.width / [self controlSize:_selected].width)
+                @(frame.size.width / [self controlSize:_selected].width), @2
             ];
             [self savePreferences];
         } else if (!save) {
