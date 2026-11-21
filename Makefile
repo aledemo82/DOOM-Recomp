@@ -1,43 +1,48 @@
-# DOOM (2016) on Recomp-Framework (framework/, a git submodule): static recompilation to native arm64 macOS.
-#   make gen gen-dll gen-bink   translate DOOMx64vk.exe, superscriptx64.dll and bink2w64.dll
-#   make -j8 boot               build the runtime + translated game
-#   make app                    build/DOOM.app
-#   make kosmickrisp            build the Vulkan driver from Mesa (with the framework's patches)
-#   make steam-play             register the app with NightSight Recomp (NSR), the Steam Play tool (needs NotProton)
-FW        = framework
-PYTHON    = .venv/bin/python
-BUILD     = build
-GAME_EXE ?= orig.exe
-APP_NAME  = DOOM
-BUNDLE_ID = com.nightsightproductions.doom-recomp
-APP_CATEGORY = public.app-category.action-games
-GAME_SRC  = src/game.c src/native_idtech.c
-NATIVE    = tools/native.txt
-PATCHES   = tools/patches.txt
-# the game's DLLs that contain code, translated as modules (rules below)
-EXTRA_LIBS_FORCE = $(BUILD)/libsuperscriptx64.a $(BUILD)/libbink2w64.a
+# iOS build of the translated game: static libraries for the Xcode target in ios/app.
+#   make -f ios/Makefile libs -j8   libgame.a + the two rebased DLL libraries + the iOS runtime sources
+# Translate first: `make gen` (exe), and for the DLLs rebased into the claimed strip (see ios/README.md):
+#   .venv/bin/python framework/tools/recomp64.py orig_superscript.dll gen_superscript_ios --module superscriptx64 --rebase 155000000
+#   .venv/bin/python framework/tools/recomp64.py orig_bink.dll gen_bink_ios --module bink2w64 --rebase 156000000 --no-abi-trim
+FW     = framework
+OUT    = ios/build
+SDK   := $(shell xcrun --sdk iphoneos --show-sdk-path)
+CC     = xcrun clang -target arm64-apple-ios26.0 -isysroot $(SDK)
+GEN_CFLAGS = -O2 -g0 -Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-label -DRT_RELAX_FP -I$(FW)/runtime
 
-include $(FW)/recomp.mk
-# The game synchronizes its threads through integer flags and locks, so float and vector accesses don't need
-# x86 ordering (see the framework README, "Memory ordering")
-GEN_CFLAGS += -DRT_RELAX_FP
+define LIB
+$(1)_SRC = $$(sort $$(wildcard $(2)/code_*.c)) $(2)/tables.c
+$(1)_OBJ = $$(patsubst %.c,$$(OUT)/%.o,$$($(1)_SRC))
+$$(OUT)/$(2)/%.o: $(2)/%.c $(FW)/runtime/cpu.h $(FW)/runtime/tables.h
+	@mkdir -p $$(dir $$@)
+	$$(CC) $$(GEN_CFLAGS) $(3) -c $$< -o $$@
+$$(OUT)/lib$(1).a: $$($(1)_OBJ)
+	rm -f $$@; ar rcs $$@ $$^
+endef
+$(eval $(call LIB,game,gen,))
+$(eval $(call LIB,superscriptx64,gen_superscript_ios,))
+$(eval $(call LIB,bink2w64,gen_bink_ios,-DRT_TSO=0))
 
-# superscriptx64.dll (the script VM); orig_superscript.dll links to the game's copy, like orig.exe
-SUPERSCRIPT_DLL ?= orig_superscript.dll
-$(eval $(call MODULE_RULES,superscriptx64,$(SUPERSCRIPT_DLL),gen_superscript,,))
-# RAD Bink 2 (bink2w64.dll): same preferred base as superscriptx64, so it is translated rebased to 0x182000000.
-# It only synchronizes through kernel objects, so it needs no TSO ordering.
-BINK_DLL ?= orig_bink.dll
-$(eval $(call MODULE_RULES,bink2w64,$(BINK_DLL),gen_bink,--rebase 182000000 --no-abi-trim,-DRT_TSO=0))
-
-gen-dll: gen-superscriptx64
-gen-bink: gen-bink2w64
-.PHONY: gen-dll gen-bink
-
-# Steam Play: Play on DOOM's own Steam entry starts the app (framework/tools/nsr.py, NightSight Recomp)
-APP_PATH ?= $(CURDIR)/$(BUILD)/$(APP_NAME).app
-steam-play:
-	python3 $(FW)/tools/nsr.py install
-	python3 $(FW)/tools/nsr.py add --appid 379720 --app "$(APP_PATH)" --pass-paths --exe 'doomx64*.exe' \
-	    --force-exe DOOMx64vk.exe --name DOOM
-.PHONY: steam-play
+libs: $(OUT)/libgame.a $(OUT)/libsuperscriptx64.a $(OUT)/libbink2w64.a $(OUT)/rt.c $(OUT)/steam.c $(OUT)/kernel32.c $(OUT)/vulkan.c
+# framework/runtime/rt.c with the iOS guest-strip patch applied (the framework submodule stays pristine)
+$(OUT)/rt.c: $(FW)/runtime/rt.c ios/patches/framework/0001-ios-claim-guest-strip.patch
+	@mkdir -p $(OUT)
+	cp $(FW)/runtime/rt.c $@
+	patch $@ < ios/patches/framework/0001-ios-claim-guest-strip.patch
+# Use native present modes on iOS and remove the framework's adaptive timer.
+$(OUT)/vulkan.c: $(FW)/runtime/vulkan.c ios/patches/framework/0002-ios-vulkan-standard-vsync.patch
+	@mkdir -p $(OUT)
+	patch -o $@.tmp $< < ios/patches/framework/0002-ios-vulkan-standard-vsync.patch
+	mv $@.tmp $@
+# steam.c with a short offline-failure delay: the stubbed Steam ticket request otherwise takes 10 s per attempt (30 s of
+# title-storage login retries at startup). DOOM_ONLINE_LOGIN=1 restores the original delay.
+$(OUT)/steam.c: $(FW)/runtime/steam.c
+	@mkdir -p $(OUT)
+	sed 's|^\#define OFFLINE_DELAY_MS 10000.*|static int offline_delay_ms(void) { const char *e = getenv("DOOM_ONLINE_LOGIN"); return e \&\& *e == 0x31 ? 10000 : 300; }\n\#define OFFLINE_DELAY_MS offline_delay_ms()|' $< > $@
+# kernel32.c reporting an 8 GB machine: the framework claims 16 GB, so the game sizes its caches for it and grows past the
+# ~6 GB an iPhone app may use (footprint climbed to 5.9 GB and the game then crashed on a failed allocation).
+$(OUT)/kernel32.c: $(FW)/runtime/kernel32.c
+	@mkdir -p $(OUT)
+	sed -e 's|total = 16ull << 30, avail = 12ull << 30|total = 8ull << 30, avail = 5ull << 30|' -e 's|wr64(b + 8, 16ull << 30); wr64(b + 16, 12ull << 30); wr64(b + 24, 32ull << 30); wr64(b + 32, 24ull << 30)|wr64(b + 8, 8ull << 30); wr64(b + 16, 5ull << 30); wr64(b + 24, 16ull << 30); wr64(b + 32, 10ull << 30)|' $< > $@
+ios/runtime/display_ios.c: $(FW)/runtime/display.c ios/scripts/gen_display_ios.py
+	python3 ios/scripts/gen_display_ios.py .
+.PHONY: libs

@@ -1,0 +1,55 @@
+name: DOOM
+options:
+  bundleIdPrefix: com.aledemo82
+  deploymentTarget:
+    iOS: "26.0"
+settings:
+  base:
+    DEVELOPMENT_TEAM: R72X3BF4KE
+    CODE_SIGN_STYLE: Automatic
+targets:
+  DOOM:
+    type: application
+    platform: iOS
+    sources:
+      # the iOS side (UIKit window system, boot, display, Vulkan bootstrap)
+      - path: ../runtime
+        includes: [cocoa_ios.m, boot_ios.m, display_ios.c, vk_ios.c]
+      # framework runtime sources compiled directly
+      - path: ../../framework/runtime
+        includes: [teb.c, handles.c, files.c, window.c, bcrypt.c, input.c, xaudio2.c, pdh.c,
+                   system.c, dinput.c, sockets.c, wasapi.c, fiber.c, user32.c, native.c, spvfix.c, xreverb.c,
+                   winhttp.m, gamepad.m, gpucapture.m]
+      # DOOM artwork: not committed (copyrighted); put your own AppIcon.appiconset in ios/app/Assets.xcassets
+      - path: Assets.xcassets
+        optional: true
+      - path: ../build/vulkan.c
+      - path: ../build/rt.c
+      - path: ../build/steam.c
+      - path: ../build/kernel32.c
+      - path: ../../src
+        includes: [game.c, native_idtech.c]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aledemo82.doomios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_DEBUG_DYLIB: NO
+        ENABLE_PREVIEWS: NO
+        CODE_SIGN_ENTITLEMENTS: DOOM.entitlements
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: Info.plist
+        CLANG_ENABLE_OBJC_ARC: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GCC_OPTIMIZATION_LEVEL: "1"
+        GCC_WARN_INHIBIT_ALL_WARNINGS: YES
+        GCC_PREPROCESSOR_DEFINITIONS: "kAudioUnitSubType_DefaultOutput=kAudioUnitSubType_RemoteIO"
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/../../framework/runtime $(SRCROOT)/../../framework/third_party/vulkan/include"
+        OTHER_CFLAGS: "-include $(SRCROOT)/../runtime/ios_compat.h -DRT_RELAX_FP"
+        LIBRARY_SEARCH_PATHS: "$(SRCROOT)/../build"
+        OTHER_LDFLAGS: "-lgame -Wl,-force_load,$(SRCROOT)/../build/libsuperscriptx64.a -Wl,-force_load,$(SRCROOT)/../build/libbink2w64.a -Wl,-export_dynamic -framework Metal -framework QuartzCore -framework AudioToolbox -framework CoreAudio -framework AVFAudio -framework GameController -framework CoreHaptics -framework CoreMotion -framework CoreGraphics -framework CoreFoundation"
+    # The Vulkan driver is dlopen'd at run time (vk_ios.c): embedded and signed, not linked.
+    dependencies:
+      - framework: ../build/libvulkan_kosmickrisp.dylib
+        link: false
+        embed: true
+        codeSign: true
