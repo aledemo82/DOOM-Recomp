@@ -15,6 +15,8 @@
 #include "cocoa.h"
 void rt_log(const char *fmt, ...);
 void rt_ios_gpu_pause(int paused);   // vk_ios.c
+void rt_ios_cap30_configure(int enabled);
+void rt_ios_cap30_display_tick(double target);
 
 enum {
     WM_MOVE = 3, WM_SIZE = 5, WM_ACTIVATE = 6, WM_SETFOCUS = 7, WM_KILLFOCUS = 8, WM_CLOSE = 0x10, WM_ACTIVATEAPP = 0x1C,
@@ -1130,7 +1132,7 @@ static void start_gyro(void) {
 }
 
 // ProMotion: tell the system this app wants 60-120 Hz. Without a request iOS can settle the display at 30 Hz when
-// frames arrive irregularly (a Metal layer alone does not ask for a rate). The link itself does nothing.
+// frames arrive irregularly. The optional cap also uses this display link.
 @interface RTRateHint : NSObject - (void)tick:(CADisplayLink *)l; @end
 double cocoa_dl_interval_ms = 0; int cocoa_dl_count;   // measured display-link period (read by the perf log)
 @implementation RTRateHint
@@ -1138,6 +1140,7 @@ double cocoa_dl_interval_ms = 0; int cocoa_dl_count;   // measured display-link 
     static CFTimeInterval last; CFTimeInterval t = l.timestamp;
     if (last) { cocoa_dl_interval_ms += (t - last) * 1000; cocoa_dl_count++; }
     last = t;
+    rt_ios_cap30_display_tick(l.targetTimestamp);
 }
 @end
 static RTRateHint *g_hint; static CADisplayLink *g_link;
@@ -1152,6 +1155,12 @@ static void request_high_refresh(void) {
 void gamepad_start(void);
 void cocoa_ios_start(void) {
     cocoa_ios_screen_init();
+    NSURL *docs = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory
+                                                       inDomains:NSUserDomainMask].firstObject;
+    NSString *capPath = [docs URLByAppendingPathComponent:@"cap30.txt"].path;
+    BOOL isDirectory = NO;
+    BOOL enabled = capPath && [NSFileManager.defaultManager fileExistsAtPath:capPath isDirectory:&isDirectory];
+    rt_ios_cap30_configure(enabled && !isDirectory);
     request_high_refresh();
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     double sensitivity = [defaults doubleForKey:@"sens"];
