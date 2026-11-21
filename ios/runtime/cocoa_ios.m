@@ -394,8 +394,8 @@ typedef enum { ACT_KEY, ACT_MOUSE, ACT_WHEEL, ACT_CUSTOM } ActKind;
 @property ActKind kind;
 @property int code, arg;
 @property uint16_t character;
-@property(nonatomic) BOOL held, armed, pulsePrimary, pulseSecondary;
-@property NSUInteger sequence;
+- (void)pressed;
+- (void)released;
 - (void)cancelInput;
 - (void)updateTitle;
 @end
@@ -409,7 +409,12 @@ static CGRect touch_bounds(CGRect frame, CGFloat minimum) {
                              -fmax(0, minimum - frame.size.height) / 2);
 }
 
-@implementation RTActionButton
+@implementation RTActionButton {
+    BOOL _held, _armed, _pulsePrimary, _pulseSecondary;
+    NSUInteger _sequence;
+}
+
+@synthesize kind = _kind, code = _code, arg = _arg, character = _character;
 - (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)event {
     return CGRectContainsPoint(touch_bounds(self.bounds, g_touch_target), p);
 }
@@ -430,9 +435,9 @@ static CGRect touch_bounds(CGRect frame, CGFloat minimum) {
 }
 
 - (void)pressed {
-    if (self.held || self.pulseSecondary || !g_touch_active || g_touch_editing || g_touch_hidden ||
+    if (_held || _pulseSecondary || !g_touch_active || g_touch_editing || g_touch_hidden ||
         !atomic_load(&g_key_hwnd)) return;
-    self.held = YES;
+    _held = YES;
     if (self.kind == ACT_KEY) touch_key(self.code, self.character, 1);
     if (self.kind == ACT_MOUSE) touch_mouse(self.code, 1);
     if (self.kind == ACT_WHEEL) {
@@ -442,40 +447,41 @@ static CGRect touch_bounds(CGRect frame, CGFloat minimum) {
                        pack_pos(atomic_load(&g_cx), atomic_load(&g_cy)));
     }
     if (self.isSecondary) {
-        NSUInteger sequence = ++self.sequence;
+        NSUInteger sequence = ++_sequence;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (sequence == self.sequence && self.held) self.armed = YES;
+            if (sequence == self->_sequence && self->_held) [self setArmed:YES];
         });
     }
 }
 
 - (void)cancelInput {
-    self.sequence++;
-    self.armed = NO;
-    if (self.held && self.kind == ACT_KEY) touch_key(self.code, self.character, 0);
-    if (self.held && self.kind == ACT_MOUSE) touch_mouse(self.code, 0);
-    if (self.pulsePrimary) touch_mouse(1, 0);
-    if (self.pulseSecondary) touch_mouse(2, 0);
-    self.held = self.pulsePrimary = self.pulseSecondary = NO;
+    _sequence++;
+    [self setArmed:NO];
+    if (_held && self.kind == ACT_KEY) touch_key(self.code, self.character, 0);
+    if (_held && self.kind == ACT_MOUSE) touch_mouse(self.code, 0);
+    if (_pulsePrimary) touch_mouse(1, 0);
+    if (_pulseSecondary) touch_mouse(2, 0);
+    _held = _pulsePrimary = _pulseSecondary = NO;
 }
 
 // Releasing an armed ALT FIRE performs the existing primary/secondary sequence.
 // Cancellation only releases buttons. Old callbacks cannot affect a new touch.
 - (void)released {
-    if (!self.held) return;
-    if (self.isSecondary && self.armed) {
-        NSUInteger sequence = ++self.sequence;
-        self.held = self.armed = NO;
-        self.pulsePrimary = self.pulseSecondary = YES;
+    if (!_held) return;
+    if (self.isSecondary && _armed) {
+        NSUInteger sequence = ++_sequence;
+        _held = NO;
+        [self setArmed:NO];
+        _pulsePrimary = _pulseSecondary = YES;
         touch_mouse(1, 1);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (sequence != self.sequence) return;
-            self.pulsePrimary = NO;
+            if (sequence != self->_sequence) return;
+            self->_pulsePrimary = NO;
             touch_mouse(1, 0);
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 160 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (sequence != self.sequence) return;
-            self.pulseSecondary = NO;
+            if (sequence != self->_sequence) return;
+            self->_pulseSecondary = NO;
             touch_mouse(2, 0);
         });
         return;
@@ -501,7 +507,7 @@ static CGRect touch_bounds(CGRect frame, CGFloat minimum) {
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [super touchesMoved:touches withEvent:event];
-    if (!self.held || !(self.kind == ACT_MOUSE || (self.kind == ACT_KEY && self.code == 12))) return;
+    if (!_held || !(self.kind == ACT_MOUSE || (self.kind == ACT_KEY && self.code == 12))) return;
     UITouch *touch = touches.anyObject;
     CGPoint p = [touch locationInView:g_root.view], q = [touch previousLocationInView:g_root.view];
     uint64_t hwnd = atomic_load(&g_key_hwnd);
@@ -659,7 +665,7 @@ static UIButton *toolbar_button(NSString *title) {
     NSMutableArray *buttons = [NSMutableArray arrayWithCapacity:kStickIndex];
     for (NSUInteger i = 0; i < kStickIndex; i++) {
         const RTTouchControl *control = &kTouchControls[i];
-        RTActionButton *button = [RTActionButton buttonWithType:UIButtonTypeCustom];
+        RTActionButton *button = [[RTActionButton alloc] initWithFrame:CGRectZero];
         button.exclusiveTouch = NO;
         button.kind = control->kind;
         button.code = control->code;
