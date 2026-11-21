@@ -2,12 +2,14 @@
 // RT_VULKAN_LIB names; boot_ios.m points that at this executable, and this function forwards to the KosmicKrisp ICD
 // (Frameworks/libvulkan_kosmickrisp.dylib), which only exports vk_icdGetInstanceProcAddr.
 #include <dlfcn.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <mach-o/dyld.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <time.h>
 #define vkGetInstanceProcAddr hdr_vkGetInstanceProcAddr   /* our definition below must not clash with the header's */
 #include <vulkan/vulkan_core.h>
 #undef vkGetInstanceProcAddr
@@ -36,8 +38,13 @@ static void wrap_memprops2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties
 static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gate_cv = PTHREAD_COND_INITIALIZER;
 static int gate_paused;
+static uint64_t next_present_ns;  // protected by gate_mu
 void rt_ios_gpu_pause(int paused) {
-    pthread_mutex_lock(&gate_mu); gate_paused = paused; pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_mu);
+    pthread_mutex_lock(&gate_mu);
+    if (gate_paused != paused) next_present_ns = 0;
+    gate_paused = paused;
+    pthread_cond_broadcast(&gate_cv);
+    pthread_mutex_unlock(&gate_mu);
     rt_log("[vulkan] GPU submission %s\n", paused ? "paused (app inactive)" : "resumed");
 }
 static void gate_wait(void) {
@@ -49,7 +56,34 @@ static PFN_vkQueueSubmit real_submit;
 static PFN_vkQueuePresentKHR real_present;
 static PFN_vkAcquireNextImageKHR real_acquire;
 static VkResult wrap_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) { gate_wait(); return real_submit(q, n, si, f); }
-static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) { gate_wait(); return real_present(q, pi); }
+static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) {
+    const uint64_t interval_ns = 25000000;  // 40 FPS
+
+    pthread_mutex_lock(&gate_mu);
+    for (;;) {
+        while (gate_paused) pthread_cond_wait(&gate_cv, &gate_mu);
+
+        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (now >= next_present_ns) {
+            // Rebase on this submission. A pause or late frame never builds up slots.
+            next_present_ns = now + interval_ns;
+            break;
+        }
+
+        // Darwin's relative wait releases gate_mu so activation changes can wake us.
+        struct timespec remaining = { .tv_nsec = (long)(next_present_ns - now) };
+        int err = pthread_cond_timedwait_relative_np(&gate_cv, &gate_mu, &remaining);
+        if (err && err != ETIMEDOUT) {
+            pthread_mutex_unlock(&gate_mu);
+            rt_log("[vulkan] present pacing wait failed: %d\n", err);
+            return VK_ERROR_UNKNOWN;
+        }
+    }
+    pthread_mutex_unlock(&gate_mu);
+
+    // The driver may block on the swapchain. Keep the lifecycle gate available.
+    return real_present(q, pi);
+}
 static VkResult wrap_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t, VkSemaphore s, VkFence f, uint32_t *i) { gate_wait(); return real_acquire(d, sc, t, s, f, i); }
 
 __attribute__((visibility("default"), used))
