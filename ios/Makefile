@@ -1,5 +1,5 @@
 # iOS build of the translated game: static libraries for the Xcode target in ios/app.
-#   make -f ios/Makefile libs -j8   libgame.a + the two rebased DLL libraries + the patched rt.c
+#   make -f ios/Makefile libs -j8   libgame.a + the two rebased DLL libraries + the iOS runtime sources
 # Translate first: `make gen` (exe), and for the DLLs rebased into the claimed strip (see ios/README.md):
 #   .venv/bin/python framework/tools/recomp64.py orig_superscript.dll gen_superscript_ios --module superscriptx64 --rebase 155000000
 #   .venv/bin/python framework/tools/recomp64.py orig_bink.dll gen_bink_ios --module bink2w64 --rebase 156000000 --no-abi-trim
@@ -22,12 +22,17 @@ $(eval $(call LIB,game,gen,))
 $(eval $(call LIB,superscriptx64,gen_superscript_ios,))
 $(eval $(call LIB,bink2w64,gen_bink_ios,-DRT_TSO=0))
 
-libs: $(OUT)/libgame.a $(OUT)/libsuperscriptx64.a $(OUT)/libbink2w64.a $(OUT)/rt.c $(OUT)/steam.c $(OUT)/kernel32.c
+libs: $(OUT)/libgame.a $(OUT)/libsuperscriptx64.a $(OUT)/libbink2w64.a $(OUT)/rt.c $(OUT)/steam.c $(OUT)/kernel32.c $(OUT)/vulkan.c
 # framework/runtime/rt.c with the iOS guest-strip patch applied (the framework submodule stays pristine)
 $(OUT)/rt.c: $(FW)/runtime/rt.c ios/patches/framework/0001-ios-claim-guest-strip.patch
 	@mkdir -p $(OUT)
 	cp $(FW)/runtime/rt.c $@
 	patch $@ < ios/patches/framework/0001-ios-claim-guest-strip.patch
+# Use native present modes on iOS and remove the framework's adaptive timer.
+$(OUT)/vulkan.c: $(FW)/runtime/vulkan.c ios/patches/framework/0002-ios-vulkan-standard-vsync.patch
+	@mkdir -p $(OUT)
+	patch -o $@.tmp $< < ios/patches/framework/0002-ios-vulkan-standard-vsync.patch
+	mv $@.tmp $@
 # steam.c with a short offline-failure delay: the stubbed Steam ticket request otherwise takes 10 s per attempt (30 s of
 # title-storage login retries at startup). DOOM_ONLINE_LOGIN=1 restores the original delay.
 $(OUT)/steam.c: $(FW)/runtime/steam.c

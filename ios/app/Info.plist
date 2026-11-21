@@ -11,7 +11,7 @@
 	<key>UIFileSharingEnabled</key><true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key><true/>
 	<key>GCSupportsControllerUserInteraction</key><true/>
-	<key>CADisableMinimumFrameDuration</key><true/>
+	<key>CADisableMinimumFrameDurationOnPhone</key><true/>
 	<key>UILaunchScreen</key><dict/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>

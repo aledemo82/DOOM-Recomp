@@ -1,0 +1,68 @@
+--- a/runtime/vulkan.c
++++ b/runtime/vulkan.c
+@@ -617,10 +617,8 @@
+ 
+ // ---------------- swapchain (logged: the first sign of the game actually drawing) ----------------
+ static uint32_t vk_present_modes;
+-static int g_adaptive; static uint64_t g_refresh_ns = 16666667;   // emulated adaptive vsync (see vkCreateSwapchainKHR)   // bit per VkPresentModeKHR the driver supports (low values only)
+ static PFN_vkGetPhysicalDeviceSurfacePresentModesKHR p_vkGetPhysicalDeviceSurfacePresentModesKHR;
+-// vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, *count, *modes): adds FIFO_RELAXED ("adaptive
+-// vsync") when the driver has FIFO, so the game's adaptive setting is selectable (see vkCreateSwapchainKHR)
++// Expose native present modes other than adaptive VSync on iOS.
+ void I_vulkan_1_dll_vkGetPhysicalDeviceSurfacePresentModesKHR(CPU *c) {
+     VK_LOAD(vkGetPhysicalDeviceSurfacePresentModesKHR, RET((uint32_t)VK_ERROR_EXTENSION_NOT_PRESENT));
+     VkPresentModeKHR modes[16]; uint32_t n = 16;
+@@ -629,7 +627,10 @@
+     uint32_t bits = 0; for (uint32_t i = 0; i < n; i++) if (modes[i] < 32) bits |= 1u << modes[i];
+     if (!vk_present_modes) { rt_log("[vulkan] driver present modes:"); for (uint32_t i = 0; i < n; i++) rt_log(" %d", modes[i]); rt_log("\n"); }
+     vk_present_modes = bits;
+-    if ((bits & (1u << VK_PRESENT_MODE_FIFO_KHR)) && !(bits & (1u << VK_PRESENT_MODE_FIFO_RELAXED_KHR)) && n < 16) modes[n++] = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
++    uint32_t count = 0;
++    for (uint32_t i = 0; i < n; i++)
++        if (modes[i] != VK_PRESENT_MODE_FIFO_RELAXED_KHR) modes[count++] = modes[i];
++    n = count;
+     uint32_t *pn = PTR(A2); VkPresentModeKHR *out = PTR(A3);
+     if (!out) { *pn = n; RET((uint32_t)VK_SUCCESS); return; }
+     uint32_t k = *pn < n ? *pn : n;
+@@ -653,20 +654,13 @@
+     VkSwapchainCreateInfoKHR sci = *(const VkSwapchainCreateInfoKHR *)PTR(A1), *ci = &sci;
+     sci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;   // lets RT_SCREENSHOT copy frames out
+     VkPresentModeKHR asked = sci.presentMode;
+-    // "Adaptive" vsync (FIFO_RELAXED, advertised by vkGetPhysicalDeviceSurfacePresentModesKHR; Metal can't do
+-    // it): run the swapchain unsynced and pace presents to the display's refresh in vkQueuePresentKHR, so an
+-    // on-time frame waits for its slot and a late one goes out at once instead of waiting a whole extra
+-    // refresh (double-buffered FIFO halves 60 -> 30 fps on any slow frame; the game insists on 2 images).
+-    g_adaptive = 0;
+-    if (sci.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR && !(vk_present_modes & (1u << VK_PRESENT_MODE_FIFO_RELAXED_KHR))) {
+-        extern double cocoa_refresh_hz(void);
+-        sci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+-        g_adaptive = 1; g_refresh_ns = (uint64_t)(1e9 / cocoa_refresh_hz());
+-    }
++    // A saved adaptive setting can still request FIFO_RELAXED. Use standard FIFO.
++    if (sci.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
++        sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+     VkResult r = p_vkCreateSwapchainKHR((VkDevice)PTR(A0), ci, NULL, PTR(A3));
+     if (r == VK_SUCCESS) { g_swap_extent = sci.imageExtent; g_swap_format = sci.imageFormat; }
+-    if (asked != sci.presentMode) rt_log("[vulkan] present mode %d requested -> using %d%s\n", asked, sci.presentMode,
+-                                         g_adaptive ? " paced to the display refresh (adaptive vsync)" : "");
++    if (asked != sci.presentMode)
++        rt_log("[vulkan] present mode %d requested -> using %d (standard VSync)\n", asked, sci.presentMode);
+     { extern void cocoa_log_layer(void *); extern void *rt_window_metal_layer(uint64_t); extern uint64_t rt_last_surface_hwnd;
+       void *l = rt_last_surface_hwnd ? rt_window_metal_layer(rt_last_surface_hwnd) : NULL; if (l) cocoa_log_layer(l); }
+     rt_log("[vulkan] vkCreateSwapchainKHR(%ux%u, %u images, format %d, present mode %d) -> %d\n",
+@@ -804,15 +798,6 @@
+     if (((shot_at > 0 && (long)n == shot_at) || shot_pending) && screenshot((VkQueue)PTR(A0), &pi)) { pi.waitSemaphoreCount = 0; pi.pWaitSemaphores = NULL; }
+     shot_pending = 0;
+     if (dump_on > 0 && snap_state == 2 && snap_readback((VkQueue)PTR(A0), &pi)) { pi.waitSemaphoreCount = 0; pi.pWaitSemaphores = NULL; }
+-    if (g_adaptive) {   // present no earlier than one refresh after the previous one; late frames go at once
+-        static uint64_t next;
+-        uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+-        if (next > now && next - now < 4 * g_refresh_ns) {
+-            struct timespec ts = { 0, (long)(next - now) }; nanosleep(&ts, NULL);
+-            now = next;
+-        }
+-        next = (next && now - next < g_refresh_ns) ? next + g_refresh_ns : now + g_refresh_ns;
+-    }
+     VkResult r = p_vkQueuePresentKHR((VkQueue)PTR(A0), &pi);
+     if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;   // see vkAcquireNextImageKHR
+     if (dump_on > 0) { snap_present(); skip_present(); }

@@ -15,14 +15,15 @@ targets:
       # the iOS side (UIKit window system, boot, display, Vulkan bootstrap)
       - path: ../runtime
         includes: [cocoa_ios.m, boot_ios.m, display_ios.c, vk_ios.c]
-      # the framework runtime, unmodified, except rt.c (patched copy built by ios/Makefile)
+      # framework runtime sources compiled directly
       - path: ../../framework/runtime
-        includes: [teb.c, handles.c, files.c, vulkan.c, window.c, bcrypt.c, input.c, xaudio2.c, pdh.c,
+        includes: [teb.c, handles.c, files.c, window.c, bcrypt.c, input.c, xaudio2.c, pdh.c,
                    system.c, dinput.c, sockets.c, wasapi.c, fiber.c, user32.c, native.c, spvfix.c, xreverb.c,
                    winhttp.m, gamepad.m, gpucapture.m]
       # DOOM artwork: not committed (copyrighted); put your own AppIcon.appiconset in ios/app/Assets.xcassets
       - path: Assets.xcassets
         optional: true
+      - path: ../build/vulkan.c
       - path: ../build/rt.c
       - path: ../build/steam.c
       - path: ../build/kernel32.c

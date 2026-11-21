@@ -7,6 +7,7 @@
 //   hardware keyboard / mouse (GameController) -> keys, buttons, relative motion
 // win_from_cocoa() and friends only take window.c's queue lock, so they may be called from UIKit's thread.
 #import <UIKit/UIKit.h>
+#import <QuartzCore/CADisplayLink.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <GameController/GameController.h>
 #import <CoreMotion/CoreMotion.h>
@@ -1129,8 +1130,7 @@ static void start_gyro(void) {
     }];
 }
 
-// ProMotion: tell the system this app wants 60-120 Hz. Without a request iOS can settle the display at 30 Hz when
-// frames arrive irregularly (a Metal layer alone does not ask for a rate). The link itself does nothing.
+// Request 40 Hz on ProMotion displays. The display link samples callback timing only.
 @interface RTRateHint : NSObject - (void)tick:(CADisplayLink *)l; @end
 double cocoa_dl_interval_ms = 0; int cocoa_dl_count;   // measured display-link period (read by the perf log)
 @implementation RTRateHint
@@ -1141,10 +1141,11 @@ double cocoa_dl_interval_ms = 0; int cocoa_dl_count;   // measured display-link 
 }
 @end
 static RTRateHint *g_hint; static CADisplayLink *g_link;
-static void request_high_refresh(void) {
+static void request_display_rate(void) {
     g_hint = [RTRateHint new];
     g_link = [CADisplayLink displayLinkWithTarget:g_hint selector:@selector(tick:)];
-    g_link.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
+    if (UIScreen.mainScreen.maximumFramesPerSecond > 60)
+        g_link.preferredFrameRateRange = CAFrameRateRangeMake(40, 40, 40);
     [g_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
 
@@ -1152,7 +1153,7 @@ static void request_high_refresh(void) {
 void gamepad_start(void);
 void cocoa_ios_start(void) {
     cocoa_ios_screen_init();
-    request_high_refresh();
+    request_display_rate();
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     double sensitivity = [defaults doubleForKey:@"sens"];
     if (isfinite(sensitivity) && sensitivity >= 0.5 && sensitivity <= 3) g_sens = sensitivity;
