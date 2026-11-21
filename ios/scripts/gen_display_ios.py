@@ -19,20 +19,31 @@ new = r'''static void disp_init(void) {
     cocoa_ios_screen(&sw, &sh, &shz);
     Disp *d = &disps[0];
     d->id = 1; d->w = (uint32_t)sw; d->h = (uint32_t)sh; d->hz = (uint32_t)shz; d->x = d->y = 0;
-    snap_ratio(&d->w, &d->h);
+    // Keep native display ratio exact: do not snap iPhone panel dimensions.
     d->capw = d->w; d->caph = d->h;
-    // a ladder of common widths at the screen's own aspect ratio (Windows drivers list these as scaled modes)
+    // iOS fullscreen presets: exact requested width, height scaled to the
+    // current panel ratio and rounded to an even pixel count.
+    // Add directly: add_mode() snaps unusual aspect ratios to other ratios.
     {
-        uint32_t g = d->w, b = d->h; while (b) { uint32_t t = g % b; g = b; b = t; }
-        uint32_t p = d->w / g, q = d->h / g;
-        static const uint32_t widths[] = { 1280, 1440, 1600, 1680, 1920, 2240, 2560, 2880, 3200, 3840, 5120 };
-        for (size_t i = 0; p <= 64 && i < sizeof widths / sizeof *widths; i++) {
-            uint32_t k = widths[i] / p;
-            if (k && k * p <= d->capw) add_mode(d, k * p, k * q, d->hz);
+        static const uint32_t widths[] = { 1280, 1440, 1650, 1920 };
+        for (size_t i = 0; i < sizeof widths / sizeof *widths; i++) {
+            uint32_t w = widths[i];
+            uint32_t h = (uint32_t)lround((double)w * d->h / d->w / 2.0) * 2;
+            if (h < 480 || w > d->capw || h > d->caph) continue;
+            int found = 0;
+            for (int j = 0; j < d->nmodes; j++)
+                if (d->modes[j].w == w && d->modes[j].h == h && d->modes[j].hz == d->hz)
+                    found = 1;
+            if (!found) {
+                d->modes = realloc(d->modes, sizeof(Mode) * (d->nmodes + 1));
+                d->modes[d->nmodes++] = (Mode){ w, h, d->hz };
+            }
         }
     }
     d->nw = d->w; d->nh = d->h;
-    add_mode(d, d->w, d->h, d->hz);
+    // Preserve native dimensions, without snap_ratio.
+    d->modes = realloc(d->modes, sizeof(Mode) * (d->nmodes + 1));
+    d->modes[d->nmodes++] = (Mode){ d->w, d->h, d->hz };
     qsort(d->modes, d->nmodes, sizeof(Mode), mode_cmp);
     rt_log("[display] DISPLAY1: %ux%u @ %u Hz primary, %d modes\n", d->w, d->h, d->hz, d->nmodes);
     if (getenv("RT_LIST_MODES")) for (int i = 0; i < d->nmodes; i++) rt_log("[display]   %ux%u @ %u\n", d->modes[i].w, d->modes[i].h, d->modes[i].hz);
