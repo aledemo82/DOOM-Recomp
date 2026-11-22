@@ -41,9 +41,44 @@ static int cap30_enabled;
 static uint64_t cap30_tick, cap30_consumed, cap30_activation;
 static double cap30_last_target;
 
+typedef struct {
+    uint64_t start, generated, used, missed, recovered, watchdog;
+    uint64_t max_wait, max_acquire;
+} Cap30Stats;
+
+static Cap30Stats cap30_stats;  // Protected by gate_mu.
+static uint64_t cap30_last_tick_time;
+
+static uint64_t trace_now(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static void cap30_report(uint64_t wait, uint64_t acquire) {
+    pthread_mutex_lock(&gate_mu);
+    if (wait > cap30_stats.max_wait) cap30_stats.max_wait = wait;
+    if (acquire > cap30_stats.max_acquire) cap30_stats.max_acquire = acquire;
+    uint64_t now = trace_now();
+    Cap30Stats stats = cap30_stats;
+    int ready = stats.start && now - stats.start >= 5000000000ull;
+    if (ready) cap30_stats = (Cap30Stats){ .start = now };
+    pthread_mutex_unlock(&gate_mu);
+
+    if (ready) {
+        double seconds = (now - stats.start) / 1e9;
+        rt_log("[cap30 trace] %.2fs ticks=%llu (%.1f/s) used=%llu (%.1f/s) "
+               "missed=%llu recovered=%llu watchdog=%llu "
+               "maxGateAndCapWait=%.2fms maxAcquire=%.2fms\n",
+               seconds, (unsigned long long)stats.generated, stats.generated / seconds,
+               (unsigned long long)stats.used, stats.used / seconds,
+               (unsigned long long)stats.missed, (unsigned long long)stats.recovered,
+               (unsigned long long)stats.watchdog, stats.max_wait / 1e6,
+               stats.max_acquire / 1e6);
+    }
+}
+
 void rt_ios_cap30_configure(int enabled) {
     cap30_enabled = enabled;  // Set on the main thread before starting the guest.
-    rt_log("[vulkan] 30 FPS cap: %s\n", enabled ? "enabled" : "disabled");
+    rt_log("[vulkan] 30 FPS cap: %s (4 ms late window)\n", enabled ? "enabled" : "disabled");
 }
 
 void rt_ios_cap30_display_tick(double target) {
@@ -52,6 +87,12 @@ void rt_ios_cap30_display_tick(double target) {
     pthread_mutex_lock(&gate_mu);
     if (!gate_paused && target - cap30_last_target >= 1.0 / 30.0 - 0.001) {
         cap30_last_target = target;
+        uint64_t now = trace_now();
+        if (!cap30_stats.start) cap30_stats.start = now;
+        if (cap30_last_tick_time && cap30_tick != cap30_consumed)
+            cap30_stats.missed++;
+        cap30_last_tick_time = now;
+        cap30_stats.generated++;
         cap30_tick++;
         pthread_cond_broadcast(&gate_cv);
     }
@@ -62,6 +103,8 @@ void rt_ios_gpu_pause(int paused) {
     if (gate_paused != paused) {
         cap30_activation++;
         cap30_last_target = 0;
+        cap30_last_tick_time = 0;
+        cap30_stats = (Cap30Stats){0};
     }
     gate_paused = paused;
     pthread_cond_broadcast(&gate_cv);
@@ -73,31 +116,42 @@ static void gate_wait(void) {
     while (gate_paused) pthread_cond_wait(&gate_cv, &gate_mu);
     pthread_mutex_unlock(&gate_mu);
 }
-// Wait only for a future display tick. A blocked or stopped run loop falls
+// Use a fresh tick or wait for the next one. A blocked or stopped run loop falls
 // back to ordinary FIFO after 250 ms, without bypassing the lifecycle gate.
-static void acquire_gate_wait(uint64_t timeout) {
-    if (!cap30_enabled || timeout != UINT64_MAX || pthread_main_np()) {
-        gate_wait();
-        return;
-    }
-
+static void acquire_gate_wait(void) {
     pthread_mutex_lock(&gate_mu);
     for (;;) {
         while (gate_paused) pthread_cond_wait(&gate_cv, &gate_mu);
         uint64_t activation = cap30_activation;
         uint64_t previous_tick = cap30_tick;
-        uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 250000000;
+        uint64_t entry = trace_now();
+        // A slightly late acquire can use the latest unconsumed tick once.
+        // Older ticks expire and are never queued.
+        if (cap30_last_tick_time && previous_tick != cap30_consumed &&
+            entry - cap30_last_tick_time <= 4000000) {
+            cap30_consumed = previous_tick;
+            cap30_stats.used++;
+            cap30_stats.recovered++;
+            goto done;
+        }
+        uint64_t deadline = entry + 250000000;
         while (activation == cap30_activation) {
             if (cap30_tick != previous_tick && cap30_tick != cap30_consumed) {
                 cap30_consumed = cap30_tick;
+                cap30_stats.used++;
                 goto done;
             }
             uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-            if (now >= deadline) goto done;
+            if (now >= deadline) {
+                cap30_stats.watchdog++;
+                goto done;
+            }
             struct timespec remaining = { .tv_nsec = (long)(deadline - now) };
             if (pthread_cond_timedwait_relative_np(&gate_cv, &gate_mu, &remaining) &&
-                activation == cap30_activation)
+                activation == cap30_activation) {
+                cap30_stats.watchdog++;
                 goto done;
+            }
         }
     }
 
@@ -108,51 +162,29 @@ done:
 static PFN_vkQueueSubmit real_submit;
 static PFN_vkQueuePresentKHR real_present;
 static PFN_vkAcquireNextImageKHR real_acquire;
-// Report slow calls and gaps, at most once per second per operation and thread.
-static uint64_t trace_now(void) {
-    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-}
-static void trace_slow(const char *name, uint64_t start, uint64_t end,
-                       uint64_t *last_log) {
-    if (end - start < 30000000 || (*last_log && end - *last_log < 1000000000))
-        return;
-    *last_log = end;
-    rt_log("[frame trace] %s %.2f ms\n", name, (end - start) / 1e6);
-}
 static VkResult wrap_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
-    static _Thread_local uint64_t last_driver_log, last_gate_log;
-    uint64_t entry = trace_now();
     gate_wait();
-    uint64_t begin = trace_now();
-    VkResult result = real_submit(q, n, si, f);
-    uint64_t end = trace_now();
-    trace_slow("submit gate", entry, begin, &last_gate_log);
-    trace_slow("vkQueueSubmit", begin, end, &last_driver_log);
-    return result;
+    return real_submit(q, n, si, f);
 }
+
 static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) {
-    static _Thread_local uint64_t previous_end, last_gap_log, last_driver_log, last_gate_log;
-    uint64_t entry = trace_now();
     gate_wait();
-    uint64_t begin = trace_now();
-    VkResult result = real_present(q, pi);
-    uint64_t end = trace_now();
-    if (previous_end)
-        trace_slow("between present calls", previous_end, entry, &last_gap_log);
-    trace_slow("present gate", entry, begin, &last_gate_log);
-    trace_slow("vkQueuePresentKHR", begin, end, &last_driver_log);
-    previous_end = trace_now();
-    return result;
+    return real_present(q, pi);
 }
-static VkResult wrap_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t, VkSemaphore s, VkFence f, uint32_t *i) {
-    static _Thread_local uint64_t last_driver_log, last_gate_log;
+
+static VkResult wrap_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t,
+                             VkSemaphore s, VkFence f, uint32_t *i) {
+    if (!cap30_enabled || t != UINT64_MAX || pthread_main_np()) {
+        gate_wait();
+        return real_acquire(d, sc, t, s, f, i);
+    }
+
     uint64_t entry = trace_now();
-    acquire_gate_wait(t);
+    acquire_gate_wait();
     uint64_t begin = trace_now();
     VkResult result = real_acquire(d, sc, t, s, f, i);
     uint64_t end = trace_now();
-    trace_slow("acquire gate", entry, begin, &last_gate_log);
-    trace_slow("vkAcquireNextImageKHR", begin, end, &last_driver_log);
+    cap30_report(begin - entry, end - begin);
     return result;
 }
 
