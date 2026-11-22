@@ -37,63 +37,74 @@ static void wrap_memprops2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties
 static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gate_cv = PTHREAD_COND_INITIALIZER;
 static int gate_paused;
-static int fps_cap_rate;
-static uint64_t fps_cap_tick, fps_cap_consumed, fps_cap_activation;
-static double fps_cap_last_target;
+static int cap30_enabled;
+static uint64_t cap30_tick, cap30_consumed, cap30_activation;
+static double cap30_last_target;
 
 typedef struct {
-    uint64_t start, generated, used, missed, recent_missed, watchdog;
-    uint64_t max_wait, max_acquire;
-} FPSCapStats;
+    uint64_t start, generated, used, missed, recovered, watchdog;
+    uint64_t max_wait, max_acquire, max_submit, max_present, max_gap;
+    uint64_t late_4_to_8, late_8_to_16, late_over_16, gap_samples;
+} Cap30Stats;
 
-static FPSCapStats fps_cap_stats;  // Protected by gate_mu.
-static uint64_t fps_cap_last_tick_time, fps_cap_recent_missed_tick;
+static Cap30Stats cap30_stats;  // Protected by gate_mu.
+static uint64_t cap30_last_tick_time;
+static VkSwapchainKHR last_present_swapchain;
+static uint64_t last_present_end;
 
 static uint64_t trace_now(void) {
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
 
-static void fps_cap_report(uint64_t wait, uint64_t acquire) {
+static void cap30_report(uint64_t wait, uint64_t acquire) {
     pthread_mutex_lock(&gate_mu);
-    if (wait > fps_cap_stats.max_wait) fps_cap_stats.max_wait = wait;
-    if (acquire > fps_cap_stats.max_acquire) fps_cap_stats.max_acquire = acquire;
+    if (wait > cap30_stats.max_wait) cap30_stats.max_wait = wait;
+    if (acquire > cap30_stats.max_acquire) cap30_stats.max_acquire = acquire;
     uint64_t now = trace_now();
-    FPSCapStats stats = fps_cap_stats;
+    Cap30Stats stats = cap30_stats;
     int ready = stats.start && now - stats.start >= 5000000000ull;
-    if (ready) fps_cap_stats = (FPSCapStats){ .start = now };
+    if (ready) cap30_stats = (Cap30Stats){ .start = now };
     pthread_mutex_unlock(&gate_mu);
 
     if (ready) {
         double seconds = (now - stats.start) / 1e9;
-        rt_log("[fps cap trace] %.2fs ticks=%llu (%.1f/s) used=%llu (%.1f/s) "
-               "missed=%llu acquireWithin4msOfUnusedTick=%llu watchdog=%llu "
+        rt_log("[cap30 trace] %.2fs ticks=%llu (%.1f/s) used=%llu (%.1f/s) "
+               "missed=%llu recovered=%llu watchdog=%llu "
                "maxGateAndCapWait=%.2fms maxAcquire=%.2fms\n",
                seconds, (unsigned long long)stats.generated, stats.generated / seconds,
                (unsigned long long)stats.used, stats.used / seconds,
-               (unsigned long long)stats.missed, (unsigned long long)stats.recent_missed,
+               (unsigned long long)stats.missed, (unsigned long long)stats.recovered,
                (unsigned long long)stats.watchdog, stats.max_wait / 1e6,
                stats.max_acquire / 1e6);
+        rt_log("[cap30 detail] lateUnused(4-8/8-16/>16ms)=%llu/%llu/%llu "
+               "maxSubmit=%.2fms maxPresent=%.2fms "
+               "maxPresentToAcquire=%.2fms gapSamples=%llu\n",
+               (unsigned long long)stats.late_4_to_8,
+               (unsigned long long)stats.late_8_to_16,
+               (unsigned long long)stats.late_over_16,
+               stats.max_submit / 1e6, stats.max_present / 1e6,
+               stats.max_gap / 1e6, (unsigned long long)stats.gap_samples);
     }
 }
 
-void rt_ios_fps_cap_configure(int fps) {
-    fps_cap_rate = (fps == 30 || fps == 40) ? fps : 0;
-    rt_log("[vulkan] FPS cap target: %d (0 = disabled)\n", fps_cap_rate);
+void rt_ios_cap30_configure(int enabled) {
+    cap30_enabled = enabled;  // Set on the main thread before starting the guest.
+    rt_log("[vulkan] 30 FPS cap: %s (4 ms late window)\n", enabled ? "enabled" : "disabled");
 }
 
-void rt_ios_fps_cap_display_tick(double target) {
-    if (!fps_cap_rate) return;
+void rt_ios_cap30_display_tick(double target) {
+    if (!cap30_enabled) return;
 
     pthread_mutex_lock(&gate_mu);
-    if (!gate_paused && target - fps_cap_last_target >= 1.0 / fps_cap_rate - 0.001) {
-        fps_cap_last_target = target;
+    if (!gate_paused && target - cap30_last_target >= 1.0 / 30.0 - 0.001) {
+        cap30_last_target = target;
         uint64_t now = trace_now();
-        if (!fps_cap_stats.start) fps_cap_stats.start = now;
-        if (fps_cap_last_tick_time && fps_cap_tick != fps_cap_consumed)
-            fps_cap_stats.missed++;
-        fps_cap_last_tick_time = now;
-        fps_cap_stats.generated++;
-        fps_cap_tick++;
+        if (!cap30_stats.start) cap30_stats.start = now;
+        if (cap30_last_tick_time && cap30_tick != cap30_consumed)
+            cap30_stats.missed++;
+        cap30_last_tick_time = now;
+        cap30_stats.generated++;
+        cap30_tick++;
         pthread_cond_broadcast(&gate_cv);
     }
     pthread_mutex_unlock(&gate_mu);
@@ -101,10 +112,11 @@ void rt_ios_fps_cap_display_tick(double target) {
 void rt_ios_gpu_pause(int paused) {
     pthread_mutex_lock(&gate_mu);
     if (gate_paused != paused) {
-        fps_cap_activation++;
-        fps_cap_last_target = 0;
-        fps_cap_last_tick_time = 0;
-        fps_cap_stats = (FPSCapStats){0};
+        cap30_activation++;
+        cap30_last_target = 0;
+        cap30_last_tick_time = 0;
+        last_present_end = 0;
+        cap30_stats = (Cap30Stats){0};
     }
     gate_paused = paused;
     pthread_cond_broadcast(&gate_cv);
@@ -116,37 +128,52 @@ static void gate_wait(void) {
     while (gate_paused) pthread_cond_wait(&gate_cv, &gate_mu);
     pthread_mutex_unlock(&gate_mu);
 }
-// Wait only for a future display tick. A blocked or stopped run loop falls
+// Use a fresh tick or wait for the next one. A blocked or stopped run loop falls
 // back to ordinary FIFO after 250 ms, without bypassing the lifecycle gate.
-static void acquire_gate_wait(void) {
+static void acquire_gate_wait(VkSwapchainKHR sc, uint64_t arrival) {
     pthread_mutex_lock(&gate_mu);
+    if (!gate_paused && sc == last_present_swapchain && last_present_end &&
+        arrival >= last_present_end) {
+        uint64_t gap = arrival - last_present_end;
+        if (gap > cap30_stats.max_gap) cap30_stats.max_gap = gap;
+        cap30_stats.gap_samples++;
+    }
     for (;;) {
         while (gate_paused) pthread_cond_wait(&gate_cv, &gate_mu);
-        uint64_t activation = fps_cap_activation;
-        uint64_t previous_tick = fps_cap_tick;
+        uint64_t activation = cap30_activation;
+        uint64_t previous_tick = cap30_tick;
         uint64_t entry = trace_now();
-        if (fps_cap_last_tick_time && previous_tick != fps_cap_consumed &&
-            previous_tick != fps_cap_recent_missed_tick &&
-            entry - fps_cap_last_tick_time <= 4000000) {
-            fps_cap_recent_missed_tick = previous_tick;
-            fps_cap_stats.recent_missed++;
+        if (cap30_last_tick_time && previous_tick != cap30_consumed) {
+            uint64_t age = entry - cap30_last_tick_time;
+            if (age > 16000000) cap30_stats.late_over_16++;
+            else if (age > 8000000) cap30_stats.late_8_to_16++;
+            else if (age > 4000000) cap30_stats.late_4_to_8++;
+        }
+        // A slightly late acquire can use the latest unconsumed tick once.
+        // Older ticks expire and are never queued.
+        if (cap30_last_tick_time && previous_tick != cap30_consumed &&
+            entry - cap30_last_tick_time <= 4000000) {
+            cap30_consumed = previous_tick;
+            cap30_stats.used++;
+            cap30_stats.recovered++;
+            goto done;
         }
         uint64_t deadline = entry + 250000000;
-        while (activation == fps_cap_activation) {
-            if (fps_cap_tick != previous_tick && fps_cap_tick != fps_cap_consumed) {
-                fps_cap_consumed = fps_cap_tick;
-                fps_cap_stats.used++;
+        while (activation == cap30_activation) {
+            if (cap30_tick != previous_tick && cap30_tick != cap30_consumed) {
+                cap30_consumed = cap30_tick;
+                cap30_stats.used++;
                 goto done;
             }
             uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
             if (now >= deadline) {
-                fps_cap_stats.watchdog++;
+                cap30_stats.watchdog++;
                 goto done;
             }
             struct timespec remaining = { .tv_nsec = (long)(deadline - now) };
             if (pthread_cond_timedwait_relative_np(&gate_cv, &gate_mu, &remaining) &&
-                activation == fps_cap_activation) {
-                fps_cap_stats.watchdog++;
+                activation == cap30_activation) {
+                cap30_stats.watchdog++;
                 goto done;
             }
         }
@@ -161,27 +188,45 @@ static PFN_vkQueuePresentKHR real_present;
 static PFN_vkAcquireNextImageKHR real_acquire;
 static VkResult wrap_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
     gate_wait();
-    return real_submit(q, n, si, f);
+    if (!cap30_enabled) return real_submit(q, n, si, f);
+    uint64_t start = trace_now();
+    VkResult result = real_submit(q, n, si, f);
+    uint64_t elapsed = trace_now() - start;
+    pthread_mutex_lock(&gate_mu);
+    if (elapsed > cap30_stats.max_submit) cap30_stats.max_submit = elapsed;
+    pthread_mutex_unlock(&gate_mu);
+    return result;
 }
 
 static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) {
     gate_wait();
-    return real_present(q, pi);
+    if (!cap30_enabled) return real_present(q, pi);
+    uint64_t start = trace_now();
+    VkResult result = real_present(q, pi);
+    uint64_t end = trace_now();
+    pthread_mutex_lock(&gate_mu);
+    if (end - start > cap30_stats.max_present) cap30_stats.max_present = end - start;
+    if (!gate_paused && pi->swapchainCount == 1 && result >= 0 && end >= last_present_end) {
+        last_present_swapchain = pi->pSwapchains[0];
+        last_present_end = end;
+    }
+    pthread_mutex_unlock(&gate_mu);
+    return result;
 }
 
 static VkResult wrap_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t,
                              VkSemaphore s, VkFence f, uint32_t *i) {
-    if (!fps_cap_rate || t != UINT64_MAX || pthread_main_np()) {
+    if (!cap30_enabled || t != UINT64_MAX || pthread_main_np()) {
         gate_wait();
         return real_acquire(d, sc, t, s, f, i);
     }
 
     uint64_t entry = trace_now();
-    acquire_gate_wait();
+    acquire_gate_wait(sc, entry);
     uint64_t begin = trace_now();
     VkResult result = real_acquire(d, sc, t, s, f, i);
     uint64_t end = trace_now();
-    fps_cap_report(begin - entry, end - begin);
+    cap30_report(begin - entry, end - begin);
     return result;
 }
 
