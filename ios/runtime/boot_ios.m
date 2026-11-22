@@ -109,7 +109,7 @@ static void *perf_thread(void *arg) {
         malloc_zone_statistics(NULL, &heap);
         o += snprintf(line + o, sizeof line - (size_t)o,
                       " | mallocInUse=%.1fMiB mallocReserved=%.1fMiB",
-                      heap.bytes_in_use / 1048576.0, heap.size_allocated / 1048576.0);
+                      heap.size_in_use / 1048576.0, heap.size_allocated / 1048576.0);
         if (metal) {
             snprintf(line + o, sizeof line - (size_t)o, " metalAllocated=%.1fMiB",
                      metal.currentAllocatedSize / 1048576.0);
