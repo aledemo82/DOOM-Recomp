@@ -7,7 +7,6 @@
 //   hardware keyboard / mouse (GameController) -> keys, buttons, relative motion
 // win_from_cocoa() and friends only take window.c's queue lock, so they may be called from UIKit's thread.
 #import <UIKit/UIKit.h>
-#import <QuartzCore/CADisplayLink.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <GameController/GameController.h>
 #import <CoreMotion/CoreMotion.h>
@@ -16,6 +15,8 @@
 #include "cocoa.h"
 void rt_log(const char *fmt, ...);
 void rt_ios_gpu_pause(int paused);   // vk_ios.c
+void rt_ios_fps_cap_configure(int fps);
+void rt_ios_fps_cap_display_tick(double target);
 
 enum {
     WM_MOVE = 3, WM_SIZE = 5, WM_ACTIVATE = 6, WM_SETFOCUS = 7, WM_KILLFOCUS = 8, WM_CLOSE = 0x10, WM_ACTIVATEAPP = 0x1C,
@@ -1130,7 +1131,8 @@ static void start_gyro(void) {
     }];
 }
 
-// Request 40 Hz on ProMotion displays. The display link samples callback timing only.
+// ProMotion: request 120 Hz. iOS chooses the actual callback cadence.
+// The optional cap also uses this display link.
 @interface RTRateHint : NSObject - (void)tick:(CADisplayLink *)l; @end
 double cocoa_dl_interval_ms = 0; int cocoa_dl_count;   // measured display-link period (read by the perf log)
 @implementation RTRateHint
@@ -1138,14 +1140,14 @@ double cocoa_dl_interval_ms = 0; int cocoa_dl_count;   // measured display-link 
     static CFTimeInterval last; CFTimeInterval t = l.timestamp;
     if (last) { cocoa_dl_interval_ms += (t - last) * 1000; cocoa_dl_count++; }
     last = t;
+    rt_ios_fps_cap_display_tick(l.targetTimestamp);
 }
 @end
 static RTRateHint *g_hint; static CADisplayLink *g_link;
-static void request_display_rate(void) {
+static void request_high_refresh(void) {
     g_hint = [RTRateHint new];
     g_link = [CADisplayLink displayLinkWithTarget:g_hint selector:@selector(tick:)];
-    if (UIScreen.mainScreen.maximumFramesPerSecond > 60)
-        g_link.preferredFrameRateRange = CAFrameRateRangeMake(40, 40, 40);
+    g_link.preferredFrameRateRange = CAFrameRateRangeMake(120, 120, 120);
     [g_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
 
@@ -1153,7 +1155,27 @@ static void request_display_rate(void) {
 void gamepad_start(void);
 void cocoa_ios_start(void) {
     cocoa_ios_screen_init();
-    request_display_rate();
+    NSURL *docs = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory
+                                                       inDomains:NSUserDomainMask].firstObject;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *capURL = [docs URLByAppendingPathComponent:@"fpscap.txt"];
+    int fps = 0;
+    BOOL isDirectory = NO;
+    if (capURL && [fm fileExistsAtPath:capURL.path]) {
+        NSString *value = [NSString stringWithContentsOfURL:capURL
+                                                   encoding:NSUTF8StringEncoding error:NULL];
+        value = [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if ([value isEqualToString:@"30"]) fps = 30;
+        else if ([value isEqualToString:@"40"]) fps = 40;
+        else if (![value isEqualToString:@"0"])
+            rt_log("[vulkan] Invalid fpscap.txt; expected 0, 30 or 40\n");
+    } else {
+        NSString *legacyPath = [docs URLByAppendingPathComponent:@"cap30.txt"].path;
+        if (legacyPath && [fm fileExistsAtPath:legacyPath isDirectory:&isDirectory] && !isDirectory)
+            fps = 30;
+    }
+    rt_ios_fps_cap_configure(fps);
+    request_high_refresh();
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     double sensitivity = [defaults doubleForKey:@"sens"];
     if (isfinite(sensitivity) && sensitivity >= 0.5 && sensitivity <= 3) g_sens = sensitivity;
