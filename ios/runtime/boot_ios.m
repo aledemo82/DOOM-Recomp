@@ -4,6 +4,8 @@
 // `devicectl device copy`; DOOM_GAME_DIR overrides it.
 #import <UIKit/UIKit.h>
 #import <AVFAudio/AVFAudio.h>
+#import <Metal/Metal.h>
+#include <malloc/malloc.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <pthread.h>
@@ -79,6 +81,7 @@ static void vm_tag_summary(char *out, size_t n) {
 #include <os/proc.h>
 static void *perf_thread(void *arg) {
     pthread_setname_np("perf monitor");
+    id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
     for (;;) {
         sleep(5);
         thread_act_array_t th; mach_msg_type_number_t n = 0;
@@ -91,7 +94,7 @@ static void *perf_thread(void *arg) {
             if (cpu < 3.0) continue;
             char name[64] = "?"; pthread_t pt = pthread_from_mach_thread_np(th[i]);
             if (pt) pthread_getname_np(pt, name, sizeof name);
-            if (o < 900) o += snprintf(line + o, sizeof line - (size_t)o, " %s=%.0f%%", name[0] ? name : "?", cpu);
+            if (o < 740) o += snprintf(line + o, sizeof line - (size_t)o, " %.63s=%.0f%%", name[0] ? name : "?", cpu);
         }
         for (mach_msg_type_number_t i = 0; i < n; i++) mach_port_deallocate(mach_task_self(), th[i]);
         vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof *th);
@@ -102,6 +105,17 @@ static void *perf_thread(void *arg) {
         o += snprintf(line + o, sizeof line - (size_t)o, " | lowPower=%d thermal=%ld", pi.lowPowerModeEnabled, (long)pi.thermalState);
         { extern double cocoa_dl_interval_ms; extern int cocoa_dl_count;
           if (cocoa_dl_count) { o += snprintf(line + o, sizeof line - (size_t)o, " displayLink=%.2fms", cocoa_dl_interval_ms / cocoa_dl_count); cocoa_dl_interval_ms = 0; cocoa_dl_count = 0; } }
+        malloc_statistics_t heap = {0};
+        malloc_zone_statistics(NULL, &heap);
+        o += snprintf(line + o, sizeof line - (size_t)o,
+                      " | mallocInUse=%.1fMiB mallocReserved=%.1fMiB",
+                      heap.bytes_in_use / 1048576.0, heap.size_allocated / 1048576.0);
+        if (metal) {
+            snprintf(line + o, sizeof line - (size_t)o, " metalAllocated=%.1fMiB",
+                     metal.currentAllocatedSize / 1048576.0);
+        } else {
+            snprintf(line + o, sizeof line - (size_t)o, " metalAllocated=unavailable");
+        }
         rt_log("%s\n", line);
         { static int tick; if (++tick % 6 == 0) { char vl[400]; vm_tag_summary(vl, sizeof vl); rt_log("%s\n", vl); } }
     }
