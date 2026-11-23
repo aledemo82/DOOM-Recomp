@@ -17,11 +17,31 @@ enum {   // XINPUT_GAMEPAD buttons
 typedef struct {
     GCController *gc;
     CHHapticEngine *engine; id<CHHapticAdvancedPatternPlayer> player; float rumble;
-    uint32_t packet; uint8_t last[12];
 } Pad;
 static Pad pads[4];
 static pthread_mutex_t pmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
+
+typedef struct {
+    uint16_t buttons;
+    uint8_t left_trigger, right_trigger;
+    int16_t axes[4];
+} PadState;
+
+_Static_assert(sizeof(PadState) == 12, "XINPUT_GAMEPAD layout");
+
+typedef struct {
+    int connected;
+    uint32_t packet[2];
+    PadState state;
+} PadSnapshot;
+
+static PadSnapshot snapshots[4];
+// Accessed only on the main queue, including by profile callbacks.
+static GCExtendedGamepad *profiles[4];
+// Only snapshot data is accessed under this mutex. Framework calls use a separate path.
+static pthread_mutex_t snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void update_snapshot(int slot, GCExtendedGamepad *gamepad);
 
 // Windows tells programs about new devices with WM_DEVICECHANGE (DBT_DEVNODES_CHANGED), and games rescan
 // XInput when they get it: send it to the game's window on every connect and disconnect.
@@ -33,26 +53,54 @@ static void device_change(void) {
     else change_pending = 1;
 }
 static void assign(GCController *gc) {
+    GCExtendedGamepad *gamepad = gc.extendedGamepad;
+    if (!gamepad) return;
+
     pthread_mutex_lock(&pmu);
     int slot = -1;
-    for (int i = 0; i < 4; i++) if (pads[i].gc == gc) slot = i;
-    for (int i = 0; slot < 0 && i < 4; i++) if (!pads[i].gc) slot = i;
-    if (slot >= 0 && !pads[slot].gc && gc.extendedGamepad) {
-        pads[slot] = (Pad){ .gc = gc };
-        gc.playerIndex = (GCControllerPlayerIndex)slot;
-        rt_log("[gamepad] %s connected as player %d\n", gc.vendorName.UTF8String ?: "controller", slot + 1);
+    for (int i = 0; i < 4; i++) if (pads[i].gc == gc) {
+        pthread_mutex_unlock(&pmu);
+        return;
     }
+    for (int i = 0; slot < 0 && i < 4; i++) if (!pads[i].gc) slot = i;
+    if (slot >= 0) pads[slot] = (Pad){ .gc = gc };
     pthread_mutex_unlock(&pmu);
+    if (slot < 0) return;
+
+    // Connection notifications and profile updates are serialized on the main queue.
+    gc.handlerQueue = dispatch_get_main_queue();
+    profiles[slot] = gamepad;
+    gamepad.valueChangedHandler = ^(GCExtendedGamepad *profile, GCControllerElement *element) {
+        (void)element;
+        update_snapshot(slot, profile);
+    };
+    update_snapshot(slot, gamepad);
+    gc.playerIndex = (GCControllerPlayerIndex)slot;
+    rt_log("[gamepad] %s connected as player %d\n", gc.vendorName.UTF8String ?: "controller", slot + 1);
     device_change();
 }
+
 static void release(GCController *gc) {
+    CHHapticEngine *engine = nil;
+    int slot = -1;
     pthread_mutex_lock(&pmu);
     for (int i = 0; i < 4; i++) if (pads[i].gc == gc) {
-        [pads[i].engine stopWithCompletionHandler:nil];
+        slot = i;
+        engine = pads[i].engine;
         pads[i] = (Pad){ 0 };
-        rt_log("[gamepad] player %d disconnected\n", i + 1);
+        break;
     }
     pthread_mutex_unlock(&pmu);
+    if (slot < 0) return;
+
+    profiles[slot].valueChangedHandler = nil;
+    profiles[slot] = nil;
+    pthread_mutex_lock(&snapshot_mutex);
+    snapshots[slot] = (PadSnapshot){ 0 };
+    pthread_mutex_unlock(&snapshot_mutex);
+
+    [engine stopWithCompletionHandler:nil];
+    rt_log("[gamepad] player %d disconnected\n", slot + 1);
     device_change();
 }
 static void init(void) {
@@ -60,8 +108,8 @@ static void init(void) {
         // keep reading controllers while another app is in front (the game polls; macOS would drop input)
         GCController.shouldMonitorBackgroundEvents = YES;
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { assign(n.object); }];
-        [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:nil usingBlock:^(NSNotification *n) { release(n.object); }];
+        [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { assign(n.object); }];
+        [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { release(n.object); }];
         for (GCController *gc in GCController.controllers) assign(gc);
     };
     if ([NSThread isMainThread]) setup(); else dispatch_async(dispatch_get_main_queue(), setup);
@@ -72,7 +120,7 @@ static int16_t axis(float v) { v = v < -1 ? -1 : v > 1 ? 1 : v; return (int16_t)
 // XINPUT_STATE: dwPacketNumber +0, wButtons +4, bLeftTrigger +6, bRightTrigger +7, sThumbLX/LY/RX/RY +8..+14
 void gamepad_start(void) { pthread_once(&once, init); }   // cocoa.m, at app start (main thread)
 
-// Summarize polling per caller thread. Log outside the controller mutex.
+// Summarize polling per caller thread. maxRead now measures the snapshot copy.
 static void report_gamepad_poll(uint64_t started, uint64_t before_lock,
                                 uint64_t locked, int connected) {
     static _Thread_local uint64_t window, calls, connected_calls;
@@ -98,21 +146,9 @@ static void report_gamepad_poll(uint64_t started, uint64_t before_lock,
     calls = connected_calls = slow = max_prepare = max_lock = max_read = 0;
 }
 
-int gamepad_state(int user, uint8_t out[16], int guide) {
-    uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    pthread_once(&once, init);
-    if (change_pending && rt_last_surface_hwnd) device_change();
-    if (user < 0 || user > 3) return 0;
-    uint64_t before_lock = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    pthread_mutex_lock(&pmu);
-    uint64_t locked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    Pad *p = &pads[user];
-    GCExtendedGamepad *g = p->gc.extendedGamepad;
-    if (!g) {
-        pthread_mutex_unlock(&pmu);
-        report_gamepad_poll(started, before_lock, locked, 0);
-        return 0;
-    }
+static void update_snapshot(int slot, GCExtendedGamepad *g) {
+    if (profiles[slot] != g) return;
+
     uint16_t b = 0;
     if (g.dpad.up.pressed) b |= XB_UP;
     if (g.dpad.down.pressed) b |= XB_DOWN;
@@ -124,23 +160,49 @@ int gamepad_state(int user, uint8_t out[16], int guide) {
     if (g.rightThumbstickButton.pressed) b |= XB_RTHUMB;
     if (g.leftShoulder.pressed) b |= XB_LSHOULDER;
     if (g.rightShoulder.pressed) b |= XB_RSHOULDER;
-    if (guide && g.buttonHome.pressed) b |= XB_GUIDE;
+    if (g.buttonHome.pressed) b |= XB_GUIDE;
     if (g.buttonA.pressed) b |= XB_A;                 // bottom face button (Cross on PlayStation)
     if (g.buttonB.pressed) b |= XB_B;
     if (g.buttonX.pressed) b |= XB_X;
     if (g.buttonY.pressed) b |= XB_Y;
-    uint8_t s[12];
-    memcpy(s, &b, 2);
-    s[2] = (uint8_t)(g.leftTrigger.value * 255.0f + 0.5f);
-    s[3] = (uint8_t)(g.rightTrigger.value * 255.0f + 0.5f);
-    int16_t ax[4] = { axis(g.leftThumbstick.xAxis.value), axis(g.leftThumbstick.yAxis.value),
-                      axis(g.rightThumbstick.xAxis.value), axis(g.rightThumbstick.yAxis.value) };
-    memcpy(s + 4, ax, 8);
-    if (memcmp(s, p->last, sizeof s)) { memcpy(p->last, s, sizeof s); p->packet++; }   // the packet number changes with the state
-    memcpy(out, &p->packet, 4);
-    memcpy(out + 4, s, 12);
-    pthread_mutex_unlock(&pmu);
-    report_gamepad_poll(started, before_lock, locked, 1);
+    PadState state = {
+        .buttons = b,
+        .left_trigger = (uint8_t)(g.leftTrigger.value * 255.0f + 0.5f),
+        .right_trigger = (uint8_t)(g.rightTrigger.value * 255.0f + 0.5f),
+        .axes = { axis(g.leftThumbstick.xAxis.value), axis(g.leftThumbstick.yAxis.value),
+                  axis(g.rightThumbstick.xAxis.value), axis(g.rightThumbstick.yAxis.value) },
+    };
+
+    pthread_mutex_lock(&snapshot_mutex);
+    PadSnapshot *snapshot = &snapshots[slot];
+    uint16_t changed_buttons = state.buttons ^ snapshot->state.buttons;
+    int changed_analog = state.left_trigger != snapshot->state.left_trigger ||
+                         state.right_trigger != snapshot->state.right_trigger ||
+                         memcmp(state.axes, snapshot->state.axes, sizeof state.axes);
+    if ((changed_buttons & ~XB_GUIDE) || changed_analog) snapshot->packet[0]++;
+    if (changed_buttons || changed_analog) snapshot->packet[1]++;
+    snapshot->state = state;
+    snapshot->connected = 1;
+    pthread_mutex_unlock(&snapshot_mutex);
+}
+
+int gamepad_state(int user, uint8_t out[16], int guide) {
+    uint64_t started = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_once(&once, init);
+    if (change_pending && rt_last_surface_hwnd) device_change();
+    if (user < 0 || user > 3) return 0;
+
+    uint64_t before_lock = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_mutex_lock(&snapshot_mutex);
+    uint64_t locked = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    PadSnapshot snapshot = snapshots[user];
+    pthread_mutex_unlock(&snapshot_mutex);
+    report_gamepad_poll(started, before_lock, locked, snapshot.connected);
+    if (!snapshot.connected) return 0;
+
+    if (!guide) snapshot.state.buttons &= ~XB_GUIDE;
+    memcpy(out, &snapshot.packet[!!guide], 4);
+    memcpy(out + 4, &snapshot.state, sizeof snapshot.state);
     return 1;
 }
 
@@ -148,10 +210,10 @@ int gamepad_connected(int user) {
     pthread_once(&once, init);
     if (change_pending && rt_last_surface_hwnd) device_change();
     if (user < 0 || user > 3) return 0;
-    pthread_mutex_lock(&pmu);
-    int r = pads[user].gc.extendedGamepad != nil;
-    pthread_mutex_unlock(&pmu);
-    return r;
+    pthread_mutex_lock(&snapshot_mutex);
+    int connected = snapshots[user].connected;
+    pthread_mutex_unlock(&snapshot_mutex);
+    return connected;
 }
 
 // XInputSetState: the two motors (0-65535) become one haptic intensity, played as a continuous event whose

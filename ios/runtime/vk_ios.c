@@ -37,9 +37,10 @@ static void wrap_memprops2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties
 static pthread_mutex_t gate_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gate_cv = PTHREAD_COND_INITIALIZER;
 static int gate_paused;
-static int cap30_enabled;
+static int frame_cap_fps;
 static uint64_t cap30_tick, cap30_consumed, cap30_activation;
 static double cap30_last_target;
+static double cap40_next_target;
 
 typedef struct {
     uint64_t start, generated, used, missed, recovered, watchdog;
@@ -68,18 +69,18 @@ static void cap30_report(uint64_t wait, uint64_t acquire) {
 
     if (ready) {
         double seconds = (now - stats.start) / 1e9;
-        rt_log("[cap30 trace] %.2fs ticks=%llu (%.1f/s) used=%llu (%.1f/s) "
+        rt_log("[cap%d trace] %.2fs ticks=%llu (%.1f/s) used=%llu (%.1f/s) "
                "missed=%llu recovered=%llu watchdog=%llu "
                "maxGateAndCapWait=%.2fms maxAcquire=%.2fms\n",
-               seconds, (unsigned long long)stats.generated, stats.generated / seconds,
+               frame_cap_fps, seconds, (unsigned long long)stats.generated, stats.generated / seconds,
                (unsigned long long)stats.used, stats.used / seconds,
                (unsigned long long)stats.missed, (unsigned long long)stats.recovered,
                (unsigned long long)stats.watchdog, stats.max_wait / 1e6,
                stats.max_acquire / 1e6);
-        rt_log("[cap30 detail] lateUnused(4-8/8-16/>16ms)=%llu/%llu/%llu "
+        rt_log("[cap%d detail] lateUnused(4-8/8-16/>16ms)=%llu/%llu/%llu "
                "maxSubmit=%.2fms maxPresent=%.2fms "
                "maxPresentToAcquire=%.2fms gapSamples=%llu\n",
-               (unsigned long long)stats.late_4_to_8,
+               frame_cap_fps, (unsigned long long)stats.late_4_to_8,
                (unsigned long long)stats.late_8_to_16,
                (unsigned long long)stats.late_over_16,
                stats.max_submit / 1e6, stats.max_present / 1e6,
@@ -87,17 +88,37 @@ static void cap30_report(uint64_t wait, uint64_t acquire) {
     }
 }
 
-void rt_ios_cap30_configure(int enabled) {
-    cap30_enabled = enabled;  // Set on the main thread before starting the guest.
-    rt_log("[vulkan] 30 FPS cap: %s (4 ms late window)\n", enabled ? "enabled" : "disabled");
+void rt_ios_frame_cap_configure(int fps) {
+    frame_cap_fps = fps;  // Set on the main thread before starting the guest.
+    rt_log("[vulkan] %d FPS cap: %s (4 ms late window)\n",
+           fps ? fps : 30, fps ? "enabled" : "disabled");
 }
 
-void rt_ios_cap30_display_tick(double target) {
-    if (!cap30_enabled) return;
+// Called with gate_mu held. Preserve the existing 30 FPS gate. At 40 FPS,
+// track the next deadline so 60 Hz can alternate one and two refresh intervals.
+static int frame_cap_tick_due(double target) {
+    if (frame_cap_fps == 30) {
+        if (target - cap30_last_target < 1.0 / 30.0 - 0.001) return 0;
+        cap30_last_target = target;
+        return 1;
+    }
+
+    const double period = 1.0 / 40.0;
+    if (target < cap40_next_target - 0.001) return 0;
+    if (!cap40_next_target || target >= cap40_next_target + period) {
+        // Restart after a long gap without issuing a burst of missed ticks.
+        cap40_next_target = target + period;
+    } else {
+        cap40_next_target += period;
+    }
+    return 1;
+}
+
+void rt_ios_frame_cap_display_tick(double target) {
+    if (!frame_cap_fps) return;
 
     pthread_mutex_lock(&gate_mu);
-    if (!gate_paused && target - cap30_last_target >= 1.0 / 30.0 - 0.001) {
-        cap30_last_target = target;
+    if (!gate_paused && frame_cap_tick_due(target)) {
         uint64_t now = trace_now();
         if (!cap30_stats.start) cap30_stats.start = now;
         if (cap30_last_tick_time && cap30_tick != cap30_consumed)
@@ -114,6 +135,7 @@ void rt_ios_gpu_pause(int paused) {
     if (gate_paused != paused) {
         cap30_activation++;
         cap30_last_target = 0;
+        cap40_next_target = 0;
         cap30_last_tick_time = 0;
         last_present_end = 0;
         cap30_stats = (Cap30Stats){0};
@@ -188,7 +210,7 @@ static PFN_vkQueuePresentKHR real_present;
 static PFN_vkAcquireNextImageKHR real_acquire;
 static VkResult wrap_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFence f) {
     gate_wait();
-    if (!cap30_enabled) return real_submit(q, n, si, f);
+    if (!frame_cap_fps) return real_submit(q, n, si, f);
     uint64_t start = trace_now();
     VkResult result = real_submit(q, n, si, f);
     uint64_t elapsed = trace_now() - start;
@@ -200,7 +222,7 @@ static VkResult wrap_submit(VkQueue q, uint32_t n, const VkSubmitInfo *si, VkFen
 
 static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) {
     gate_wait();
-    if (!cap30_enabled) return real_present(q, pi);
+    if (!frame_cap_fps) return real_present(q, pi);
     uint64_t start = trace_now();
     VkResult result = real_present(q, pi);
     uint64_t end = trace_now();
@@ -216,7 +238,7 @@ static VkResult wrap_present(VkQueue q, const VkPresentInfoKHR *pi) {
 
 static VkResult wrap_acquire(VkDevice d, VkSwapchainKHR sc, uint64_t t,
                              VkSemaphore s, VkFence f, uint32_t *i) {
-    if (!cap30_enabled || t != UINT64_MAX || pthread_main_np()) {
+    if (!frame_cap_fps || t != UINT64_MAX || pthread_main_np()) {
         gate_wait();
         return real_acquire(d, sc, t, s, f, i);
     }

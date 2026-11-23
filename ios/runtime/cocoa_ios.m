@@ -15,8 +15,8 @@
 #include "cocoa.h"
 void rt_log(const char *fmt, ...);
 void rt_ios_gpu_pause(int paused);   // vk_ios.c
-void rt_ios_cap30_configure(int enabled);
-void rt_ios_cap30_display_tick(double target);
+void rt_ios_frame_cap_configure(int fps);
+void rt_ios_frame_cap_display_tick(double target);
 
 enum {
     WM_MOVE = 3, WM_SIZE = 5, WM_ACTIVATE = 6, WM_SETFOCUS = 7, WM_KILLFOCUS = 8, WM_CLOSE = 0x10, WM_ACTIVATEAPP = 0x1C,
@@ -1140,7 +1140,7 @@ double cocoa_dl_interval_ms = 0; int cocoa_dl_count;   // measured display-link 
     static CFTimeInterval last; CFTimeInterval t = l.timestamp;
     if (last) { cocoa_dl_interval_ms += (t - last) * 1000; cocoa_dl_count++; }
     last = t;
-    rt_ios_cap30_display_tick(l.targetTimestamp);
+    rt_ios_frame_cap_display_tick(l.targetTimestamp);
 }
 @end
 static RTRateHint *g_hint; static CADisplayLink *g_link;
@@ -1157,10 +1157,18 @@ void cocoa_ios_start(void) {
     cocoa_ios_screen_init();
     NSURL *docs = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory
                                                        inDomains:NSUserDomainMask].firstObject;
-    NSString *capPath = [docs URLByAppendingPathComponent:@"cap30.txt"].path;
-    BOOL isDirectory = NO;
-    BOOL enabled = capPath && [NSFileManager.defaultManager fileExistsAtPath:capPath isDirectory:&isDirectory];
-    rt_ios_cap30_configure(enabled && !isDirectory);
+    int capFPS = 0;
+    for (NSNumber *fps in @[@40, @30]) {
+        NSString *name = [NSString stringWithFormat:@"cap%@.txt", fps];
+        NSString *path = [docs URLByAppendingPathComponent:name].path;
+        BOOL isDirectory = NO;
+        if (path && [NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&isDirectory] &&
+            !isDirectory) {
+            capFPS = fps.intValue;
+            break;
+        }
+    }
+    rt_ios_frame_cap_configure(capFPS);
     request_high_refresh();
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     double sensitivity = [defaults doubleForKey:@"sens"];
