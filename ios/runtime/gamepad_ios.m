@@ -37,7 +37,8 @@ typedef struct {
 } PadSnapshot;
 
 static PadSnapshot snapshots[4];
-// Accessed only on the main queue, including by profile callbacks.
+// Controller registration, removal and profile callbacks all run on the input queue.
+static dispatch_queue_t input_queue;
 static GCExtendedGamepad *profiles[4];
 // Only snapshot data is accessed under this mutex. Framework calls use a separate path.
 static pthread_mutex_t snapshot_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -67,8 +68,7 @@ static void assign(GCController *gc) {
     pthread_mutex_unlock(&pmu);
     if (slot < 0) return;
 
-    // Connection notifications and profile updates are serialized on the main queue.
-    gc.handlerQueue = dispatch_get_main_queue();
+    gc.handlerQueue = input_queue;
     profiles[slot] = gamepad;
     gamepad.valueChangedHandler = ^(GCExtendedGamepad *profile, GCControllerElement *element) {
         (void)element;
@@ -104,13 +104,28 @@ static void release(GCController *gc) {
     device_change();
 }
 static void init(void) {
+    input_queue = dispatch_queue_create("doom.gamepad.input", DISPATCH_QUEUE_SERIAL);
     dispatch_block_t setup = ^{
-        // keep reading controllers while another app is in front (the game polls; macOS would drop input)
+        // Keep watching for input while another app is in front.
         GCController.shouldMonitorBackgroundEvents = YES;
+        NSOperationQueue *main = NSOperationQueue.mainQueue;
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { assign(n.object); }];
-        [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { release(n.object); }];
-        for (GCController *gc in GCController.controllers) assign(gc);
+        [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:main
+                    usingBlock:^(NSNotification *n) {
+            GCController *gc = n.object;
+            dispatch_async(input_queue, ^{ assign(gc); });
+        }];
+        [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:main
+                    usingBlock:^(NSNotification *n) {
+            GCController *gc = n.object;
+            dispatch_async(input_queue, ^{ release(gc); });
+        }];
+
+        NSArray<GCController *> *controllers = GCController.controllers;
+        dispatch_async(input_queue, ^{
+            rt_log("[gamepad] dedicated input queue active\n");
+            for (GCController *gc in controllers) assign(gc);
+        });
     };
     if ([NSThread isMainThread]) setup(); else dispatch_async(dispatch_get_main_queue(), setup);
 }
