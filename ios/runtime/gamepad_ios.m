@@ -21,6 +21,7 @@ typedef struct {
 static Pad pads[4];
 static pthread_mutex_t pmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
+static BOOL neutral_input;  // Set once at startup, before any XInput reads.
 
 typedef struct {
     uint16_t buttons;
@@ -104,6 +105,13 @@ static void release(GCController *gc) {
     device_change();
 }
 static void init(void) {
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSURL *documents = [files URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+    NSString *path = [documents URLByAppendingPathComponent:@"xinput-neutral.txt"].path;
+    BOOL is_directory = NO;
+    neutral_input = path && [files fileExistsAtPath:path isDirectory:&is_directory] && !is_directory;
+    rt_log("[gamepad] neutral input test: %s\n", neutral_input ? "enabled" : "disabled");
+
     input_queue = dispatch_queue_create("doom.gamepad.input", DISPATCH_QUEUE_SERIAL);
     dispatch_block_t setup = ^{
         // Keep watching for input while another app is in front.
@@ -214,6 +222,12 @@ int gamepad_state(int user, uint8_t out[16], int guide) {
     pthread_mutex_unlock(&snapshot_mutex);
     report_gamepad_poll(started, before_lock, locked, snapshot.connected);
     if (!snapshot.connected) return 0;
+
+    if (neutral_input) {
+        // Keep receiving real events, but expose a fixed packet and idle controls to the guest.
+        memset(out, 0, 16);
+        return 1;
+    }
 
     if (!guide) snapshot.state.buttons &= ~XB_GUIDE;
     memcpy(out, &snapshot.packet[!!guide], 4);
